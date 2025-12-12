@@ -12,8 +12,8 @@ CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS :=
 
 # Program
-TARGET  := reduce_scatter_8x8
-SRC     := reduce_scatter_8x8.c
+TARGET  := reduce_scatter
+SRC     := reduce_scatter.c
 
 # Run configuration
 NP      := 64
