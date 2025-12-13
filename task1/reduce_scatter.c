@@ -37,7 +37,7 @@ int main(int argc, char** argv){
 
     // Input: A[64] (example init)
     int A[V], buf[V];
-    for(int i=0;i<V;i++) A[i] = rank + i; // замените на свои данные
+    for(int i=0;i<V;i++) A[i] = rank + i;
     for(int i=0;i<V;i++) buf[i] = A[i];
 
     MPI_Status st;
@@ -53,7 +53,6 @@ int main(int argc, char** argv){
             MPI_Recv(tmp, V, MPI_INT, right, 1000 + y, grid, &st);
             for(int i=0;i<V;i++) buf[i] = imax(buf[i], tmp[i]);
         }
-        // остальные молчат на этом шаге
     }
 
     // ---------------------------
