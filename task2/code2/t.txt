@@ -1,0 +1,43 @@
+alexgud@alexgud-NBD-WXX9:~/study/msu/kurs4/distributed_systems/MSU_CMC_2025_Distributed_systems/task2/code2$ make run
+/home/alexgud/opt/openmpi-ulfm-api/bin/mpirun --oversubscribe --with-ft ulfm --mca io romio --mca romio_ds_write disable -np 4 ./gauss_ft_mpiio
+Matrix size N=2500, MPI processes=4
+Starting Gaussian elimination...
+Rank 3: MPI_File_open failed: MPI_ERR_INTERN: internal error
+Checkpoint failed!
+Rank 1: MPI_File_open failed: MPI_ERR_INTERN: internal error
+Checkpoint failed!
+Rank 1: MPI_File_open (read) failed: MPI_ERR_INTERN: internal error
+Rank 1: Failed to load checkpoint
+Rank 3: MPI_File_open (read) failed: MPI_ERR_INTERN: internal error
+Rank 3: Failed to load checkpoint
+--------------------------------------------------------------------------
+A requested component was not found, or was unable to be opened.  This
+means that this component is either not installed or is unable to be
+used on your system (e.g., sometimes this means that shared libraries
+that the component requires are unable to be found/loaded).  Note that
+Open MPI stopped checking at the first component that it did not find.
+
+Host:      alexgud-NBD-WXX9
+Framework: io
+Component: romio
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+MPI_ABORT was invoked on rank 1 in communicator MPI COMM 3 DUP FROM 0
+  Proc: [[41058,1],1]
+  Errorcode: 1
+
+NOTE: invoking MPI_ABORT causes Open MPI to kill all MPI processes.
+You may or may not see output from other processes, depending on
+exactly when Open MPI kills them.
+--------------------------------------------------------------------------
+Checkpoint at step 9
+Rank 2: MPI_File_open failed: MPI_ERR_INTERN: internal error
+Checkpoint failed!
+Rank 2: MPI_File_open (read) failed: MPI_ERR_INTERN: internal error
+Rank 2: Failed to load checkpoint
+Rank 0: MPI_File_open failed: MPI_ERR_INTERN: internal error
+Checkpoint failed!
+Rank 0: MPI_File_open (read) failed: MPI_ERR_INTERN: internal error
+Rank 0: Failed to load checkpoint
+make: *** [Makefile:40: run] Error 1
+alexgud@alexgud-NBD-WXX9:

@@ -1,0 +1,659 @@
+Моя программа не завершается, а просто печатает такие сообщения
+
+alexgud@alexgud-NBD-WXX9:~/study/msu/kurs4/distributed_systems/MSU_CMC_2025_Distributed_systems/task2/code$ make run
+/home/alexgud/opt/openmpi-ulfm-api/bin/mpirun --oversubscribe --with-ft ulfm -np 6 ./gauss_ulfm data.in ckpt.bin 2
+--------------------------------------------------------------------------
+WARNING: The selected 'io' module 'ompio' is not tested for post-failure
+operation, yet you have requested support for fault tolerance.
+When using this component, normal failure free operation is expected;
+However, failures may cause the application to abort, crash or deadlock.
+
+In this framework, the following components are tested to operate under
+failure scenarios: {}
+--------------------------------------------------------------------------
+575 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+473 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+384 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+328 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+332 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+368 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+364 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+352 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+356 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+360 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+356 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+360 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+340 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+348 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+344 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+364 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+376 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+356 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+
+/*
+ * Gaussian elimination (Ax=b, augmented matrix N x (N+1))
+ * MPI-IO checkpoint/restart + ULFM + spare ranks (scenario a).
+ *
+ * Run: mpirun -np (workers+spares) ./gauss_mpiio_ckpt_ulfm data.in ckpt.bin <spares>
+ *
+ * Failure injection (optional):
+ *   export FAIL_STEP=5
+ *   export FAIL_WORLD_RANK=2
+ * Then world rank 2 will raise(SIGKILL) when pivot step reaches FAIL_STEP.
+ */
+
+#include <mpi.h>
+/* ---- ULFM compatibility layer ---------------------------------
+ * Some ULFM-enabled MPI builds expose symbols as MPIX_* (older),
+ * others as MPI_* (newer / integrated).
+ * This block maps to whichever is available.
+ */
+#if __has_include(<mpi-ext.h>)
+  #include <mpi-ext.h>
+#endif
+
+/* Error codes */
+#ifndef MPIX_ERR_PROC_FAILED
+  #ifdef MPI_ERR_PROC_FAILED
+    #define MPIX_ERR_PROC_FAILED MPI_ERR_PROC_FAILED
+  #endif
+#endif
+
+#ifndef MPIX_ERR_PROC_FAILED_PENDING
+  #ifdef MPI_ERR_PROC_FAILED_PENDING
+    #define MPIX_ERR_PROC_FAILED_PENDING MPI_ERR_PROC_FAILED_PENDING
+  #endif
+#endif
+
+#ifndef MPIX_ERR_REVOKED
+  #ifdef MPI_ERR_REVOKED
+    #define MPIX_ERR_REVOKED MPI_ERR_REVOKED
+  #endif
+#endif
+
+/* Functions */
+#ifndef MPIX_Comm_revoke
+  #ifdef MPI_Comm_revoke
+    #define MPIX_Comm_revoke MPI_Comm_revoke
+  #endif
+#endif
+
+#ifndef MPIX_Comm_shrink
+  #ifdef MPI_Comm_shrink
+    #define MPIX_Comm_shrink MPI_Comm_shrink
+  #endif
+#endif
+
+#ifndef MPIX_Comm_agree
+  #ifdef MPI_Comm_agree
+    #define MPIX_Comm_agree MPI_Comm_agree
+  #endif
+#endif
+/* ---------------------------------------------------------------- */
+#include <mpi-ext.h>     /* ULFM */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+
+#define CKPT_MAGIC 0x434B5054 /* 'CKPT' */
+#define CKPT_VERSION 1
+
+typedef struct {
+  int magic;
+  int version;
+  int N;
+  int next_pivot;   /* next pivot index to execute */
+} ckpt_hdr_t;
+
+static void die(const char *msg) {
+  fprintf(stderr, "%s\n", msg);
+  MPI_Abort(MPI_COMM_WORLD, 1);
+  exit(1);
+}
+
+static int is_ulfm_err(int err) {
+  int eclass = 0;
+  MPI_Error_class(err, &eclass);
+  return (eclass == MPIX_ERR_PROC_FAILED ||
+          eclass == MPIX_ERR_PROC_FAILED_PENDING ||
+          eclass == MPIX_ERR_REVOKED);
+}
+
+/* Block distribution among "workers" ranks: rows [start, start+count) */
+static void block_rows(int N, int workers, int wrank, int *start, int *count) {
+  int base = N / workers;
+  int rem  = N % workers;
+  if (wrank < rem) {
+    *count = base + 1;
+    *start = wrank * (*count);
+  } else {
+    *count = base;
+    *start = rem * (base + 1) + (wrank - rem) * base;
+  }
+}
+
+/* Owner of global row r in the block distribution */
+static int owner_of_row(int N, int workers, int r) {
+  int base = N / workers;
+  int rem  = N % workers;
+  int cut  = rem * (base + 1);
+  if (r < cut) return r / (base + 1);
+  return rem + (r - cut) / base;
+}
+
+static int file_exists(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  fclose(f);
+  return 1;
+}
+
+/* MPI-IO read ASCII integer N from data.in (rank0 reads, then bcast on comm) */
+static int read_N_mpiio(MPI_Comm comm, const char *path) {
+  int rank;
+  MPI_Comm_rank(comm, &rank);
+
+  MPI_File fh;
+  int rc = MPI_File_open(comm, path, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+  if (rc != MPI_SUCCESS) die("MPI_File_open(data.in) failed");
+
+  int N = -1;
+  if (rank == 0) {
+    MPI_Offset sz = 0;
+    MPI_File_get_size(fh, &sz);
+    if (sz <= 0 || sz > 1024*1024) die("data.in size looks wrong");
+
+    char *buf = (char*)calloc((size_t)sz + 1, 1);
+    if (!buf) die("alloc failed for data.in buffer");
+
+    MPI_Status st;
+    rc = MPI_File_read_at(fh, 0, buf, (int)sz, MPI_CHAR, &st);
+    if (rc != MPI_SUCCESS) die("MPI_File_read_at(data.in) failed");
+
+    /* parse first integer */
+    N = atoi(buf);
+    free(buf);
+  }
+
+  MPI_File_close(&fh);
+  MPI_Bcast(&N, 1, MPI_INT, 0, comm);
+
+  if (N <= 0) die("Wrong N in data.in");
+  return N;
+}
+
+/* Checkpoint layout:
+ * [ckpt_hdr_t][float A (N*(N+1))]  row-major augmented matrix
+ */
+static MPI_Offset ckpt_data_offset(void) {
+  return (MPI_Offset)sizeof(ckpt_hdr_t);
+}
+
+static void ckpt_write(MPI_Comm wcomm, const char *ckpt_path,
+                       int N, int next_pivot,
+                       const float *A_local, int row_start, int row_count) {
+  int wrank;
+  MPI_Comm_rank(wcomm, &wrank);
+
+  MPI_File fh;
+  int rc = MPI_File_open(wcomm, ckpt_path,
+                         MPI_MODE_WRONLY | MPI_MODE_CREATE,
+                         MPI_INFO_NULL, &fh);
+  if (rc != MPI_SUCCESS) die("MPI_File_open(ckpt, write) failed");
+
+  /* Write header by rank 0 (but still in the same file handle) */
+  if (wrank == 0) {
+    ckpt_hdr_t hdr;
+    hdr.magic = CKPT_MAGIC;
+    hdr.version = CKPT_VERSION;
+    hdr.N = N;
+    hdr.next_pivot = next_pivot;
+    MPI_Status st;
+    rc = MPI_File_write_at(fh, 0, &hdr, (int)sizeof(hdr), MPI_BYTE, &st);
+    if (rc != MPI_SUCCESS) die("ckpt header write failed");
+  }
+
+  /* Ensure header is written before data (collective barrier on wcomm) */
+  MPI_Barrier(wcomm);
+
+  /* Write local rows into global matrix area */
+  MPI_Offset off = ckpt_data_offset() +
+                   (MPI_Offset)row_start * (MPI_Offset)(N + 1) * (MPI_Offset)sizeof(float);
+
+  MPI_Status st;
+  rc = MPI_File_write_at_all(fh, off,
+                             (void*)A_local,
+                             row_count * (N + 1),
+                             MPI_FLOAT, &st);
+  if (rc != MPI_SUCCESS) die("ckpt data write failed");
+
+  MPI_File_sync(fh);
+  MPI_File_close(&fh);
+}
+
+static int ckpt_read(MPI_Comm wcomm, const char *ckpt_path,
+                     int *N_out, int *next_pivot_out,
+                     float **A_local_out, int row_start, int row_count) {
+  MPI_File fh;
+  int rc = MPI_File_open(wcomm, ckpt_path, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+  if (rc != MPI_SUCCESS) return 0;
+
+  ckpt_hdr_t hdr;
+  MPI_Status st;
+  rc = MPI_File_read_at_all(fh, 0, &hdr, (int)sizeof(hdr), MPI_BYTE, &st);
+  if (rc != MPI_SUCCESS) die("ckpt header read failed");
+
+  if (hdr.magic != CKPT_MAGIC || hdr.version != CKPT_VERSION) {
+    MPI_File_close(&fh);
+    return 0;
+  }
+
+  int N = hdr.N;
+  int next_pivot = hdr.next_pivot;
+
+  float *A_local = (float*)malloc((size_t)row_count * (size_t)(N + 1) * sizeof(float));
+  if (!A_local) die("alloc failed for A_local");
+
+  MPI_Offset off = ckpt_data_offset() +
+                   (MPI_Offset)row_start * (MPI_Offset)(N + 1) * (MPI_Offset)sizeof(float);
+
+  rc = MPI_File_read_at_all(fh, off, A_local, row_count * (N + 1), MPI_FLOAT, &st);
+  if (rc != MPI_SUCCESS) die("ckpt data read failed");
+
+  MPI_File_close(&fh);
+
+  *N_out = N;
+  *next_pivot_out = next_pivot;
+  *A_local_out = A_local;
+  return 1;
+}
+
+/* Build worker communicator with up to target_workers ranks (lowest ranks) */
+static void make_worker_comm(MPI_Comm world, int target_workers, MPI_Comm *wcomm,
+                             int *is_worker, int *wsize, int *wrank) {
+  int r, s;
+  MPI_Comm_rank(world, &r);
+  MPI_Comm_size(world, &s);
+
+  int want_workers = target_workers;
+  if (want_workers > s) want_workers = s;
+
+  *is_worker = (r < want_workers) ? 1 : 0;
+
+  MPI_Comm_split(world, *is_worker ? 1 : MPI_UNDEFINED, r, wcomm);
+
+  if (*is_worker) {
+    MPI_Comm_rank(*wcomm, wrank);
+    MPI_Comm_size(*wcomm, wsize);
+  } else {
+    *wrank = -1;
+    *wsize = 0;
+  }
+}
+
+/* Recover after failure: revoke + shrink, rebuild worker_comm, reload from checkpoint */
+static void recover(MPI_Comm *pworld, MPI_Comm *pwcomm,
+                    int target_workers,
+                    int *is_worker, int *wsize, int *wrank,
+                    const char *ckpt_path,
+                    int *N, int *pivot_i,
+                    float **A_local, int *row_start, int *row_count) {
+  MPI_Comm world = *pworld;
+
+  /* Revoke to interrupt everyone (ULFM) */
+  MPIX_Comm_revoke(world);
+
+  /* Shrink to remove failed ranks */
+  MPI_Comm shrunk = MPI_COMM_NULL;
+  MPIX_Comm_shrink(world, &shrunk);
+
+  /* Replace world */
+  MPI_Comm_free(&world);
+  world = shrunk;
+  *pworld = world;
+
+  /* Recreate worker comm (activate spares if needed) */
+  if (*pwcomm != MPI_COMM_NULL) MPI_Comm_free(pwcomm);
+  make_worker_comm(world, target_workers, pwcomm, is_worker, wsize, wrank);
+
+  if (!(*is_worker)) {
+    /* spare stays idle after recovery too */
+    return;
+  }
+
+  /* recompute row block */
+  block_rows(*N, *wsize, *wrank, row_start, row_count);
+
+  /* reload from checkpoint (gets N and next pivot) */
+  int N2 = 0, next_p = 0;
+  float *A2 = NULL;
+  int ok = ckpt_read(*pwcomm, ckpt_path, &N2, &next_p, &A2, *row_start, *row_count);
+  if (!ok) die("Recovery failed: checkpoint not found/invalid");
+
+  if (*A_local) free(*A_local);
+  *A_local = A2;
+  *N = N2;
+  *pivot_i = next_p;
+}
+
+/* failure injection */
+static void maybe_fail_now(MPI_Comm world, int pivot_i) {
+  const char *s_step = getenv("FAIL_STEP");
+  const char *s_rank = getenv("FAIL_WORLD_RANK");
+  if (!s_step || !s_rank) return;
+
+  int fail_step = atoi(s_step);
+  int fail_rank = atoi(s_rank);
+
+  int r;
+  MPI_Comm_rank(world, &r);
+  if (r == fail_rank && pivot_i == fail_step) {
+    raise(SIGKILL);
+  }
+}
+
+int main(int argc, char **argv) {
+  MPI_Init(&argc, &argv);
+
+  MPI_Comm world = MPI_COMM_WORLD;
+  MPI_Comm_set_errhandler(world, MPI_ERRORS_RETURN); /* so we can handle errors */
+
+  int world_rank, world_size;
+  MPI_Comm_rank(world, &world_rank);
+  MPI_Comm_size(world, &world_size);
+
+  if (argc < 4) {
+    if (world_rank == 0) {
+      fprintf(stderr, "Usage: %s data.in ckpt.bin <spares>\n", argv[0]);
+      fprintf(stderr, "Example: mpirun -np 6 %s data.in ckpt.bin 2  (4 workers + 2 spares)\n", argv[0]);
+    }
+    MPI_Finalize();
+    return 2;
+  }
+
+  const char *in_path   = argv[1];
+  const char *ckpt_path = argv[2];
+  int spares = atoi(argv[3]);
+  if (spares < 0) spares = 0;
+  if (spares >= world_size) spares = world_size - 1;
+
+  int target_workers = world_size - spares;
+  if (target_workers < 1) target_workers = 1;
+
+  /* Create worker communicator (scenario a: extra ranks are spares) */
+  MPI_Comm wcomm = MPI_COMM_NULL;
+  int is_worker = 0, wsize = 0, wrank = -1;
+  make_worker_comm(world, target_workers, &wcomm, &is_worker, &wsize, &wrank);
+
+  int N = -1;
+  int pivot_i = 0;
+  float *A_local = NULL;
+
+  int row_start = 0, row_count = 0;
+
+  if (is_worker) {
+    /* Determine distribution */
+    /* If checkpoint exists, load it; else read N and init A = I | 1 */
+    if (file_exists(ckpt_path)) {
+      block_rows(1, 1, 0, &row_start, &row_count); /* temp; will recompute after reading N */
+      /* read header first to know N */
+      int Ntmp = 0, next_p = 0;
+      /* Need a correct row_count to read data; so read header with MPI-IO raw on wcomm */
+      MPI_File fh;
+      int rc = MPI_File_open(wcomm, ckpt_path, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+      if (rc != MPI_SUCCESS) die("open ckpt to probe header failed");
+      ckpt_hdr_t hdr;
+      MPI_Status st;
+      rc = MPI_File_read_at_all(fh, 0, &hdr, (int)sizeof(hdr), MPI_BYTE, &st);
+      if (rc != MPI_SUCCESS) die("read ckpt header probe failed");
+      MPI_File_close(&fh);
+      if (hdr.magic != CKPT_MAGIC) die("ckpt magic mismatch");
+      Ntmp = hdr.N;
+      next_p = hdr.next_pivot;
+
+      N = Ntmp;
+      pivot_i = next_p;
+
+      block_rows(N, wsize, wrank, &row_start, &row_count);
+      int ok = ckpt_read(wcomm, ckpt_path, &N, &pivot_i, &A_local, row_start, row_count);
+      if (!ok) die("ckpt_read failed unexpectedly");
+    } else {
+      N = read_N_mpiio(wcomm, in_path);
+      pivot_i = 0;
+      block_rows(N, wsize, wrank, &row_start, &row_count);
+
+      A_local = (float*)malloc((size_t)row_count * (size_t)(N + 1) * sizeof(float));
+      if (!A_local) die("alloc failed for A_local init");
+
+      /* init local rows of augmented matrix: identity and RHS=1 */
+      for (int rr = 0; rr < row_count; rr++) {
+        int i = row_start + rr;
+        for (int j = 0; j <= N; j++) {
+          float v = 0.0f;
+          if (j == i || j == N) v = 1.0f;
+          A_local[rr * (N + 1) + j] = v;
+        }
+      }
+
+      /* initial checkpoint so recovery can always reload */
+      ckpt_write(wcomm, ckpt_path, N, 0, A_local, row_start, row_count);
+    }
+  }
+
+  /* Main elimination + reverse substitution.
+     For simplicity: reverse substitution is done on rank0 of workers after gathering.
+     (You can also distribute it, но так проще для курсовой демонстрации FT+MPI-IO.) */
+
+  if (is_worker) {
+    /* buffer for pivot row (full row, but we only need j>=i) */
+    float *pivot_row = (float*)malloc((size_t)(N + 1) * sizeof(float));
+    if (!pivot_row) die("alloc pivot_row failed");
+
+    for (; pivot_i < N - 1; /* pivot_i advanced inside */) {
+      maybe_fail_now(world, pivot_i);
+
+      int owner = owner_of_row(N, wsize, pivot_i);
+
+      /* Owner packs the pivot row into pivot_row */
+      if (wrank == owner) {
+        int local_idx = pivot_i - row_start;
+        memcpy(pivot_row, &A_local[local_idx * (N + 1)], (size_t)(N + 1) * sizeof(float));
+      }
+
+      int rc = MPI_Bcast(pivot_row, N + 1, MPI_FLOAT, owner, wcomm);
+      if (rc != MPI_SUCCESS && is_ulfm_err(rc)) {
+        recover(&world, &wcomm, target_workers, &is_worker, &wsize, &wrank,
+                ckpt_path, &N, &pivot_i, &A_local, &row_start, &row_count);
+        if (!is_worker) break;
+        free(pivot_row);
+        pivot_row = (float*)malloc((size_t)(N + 1) * sizeof(float));
+        continue;
+      } else if (rc != MPI_SUCCESS) {
+        die("MPI_Bcast failed (non-ULFM error)");
+      }
+
+      float piv = pivot_row[pivot_i];
+      if (piv == 0.0f) die("Zero pivot (no pivoting implemented)");
+
+      /* Update local rows k>pivot_i */
+      for (int rr = 0; rr < row_count; rr++) {
+        int k = row_start + rr;
+        if (k <= pivot_i) continue;
+
+        float aik = A_local[rr * (N + 1) + pivot_i];
+        if (aik == 0.0f) continue;
+
+        float factor = aik / piv;
+        /* j = pivot_i+1..N (augmented column N included) */
+        for (int j = pivot_i + 1; j <= N; j++) {
+          A_local[rr * (N + 1) + j] -= factor * pivot_row[j];
+        }
+        A_local[rr * (N + 1) + pivot_i] = 0.0f;
+      }
+
+      /* checkpoint: next pivot */
+      int next_p = pivot_i + 1;
+      rc = MPI_Barrier(wcomm);
+      if (rc != MPI_SUCCESS && is_ulfm_err(rc)) {
+        recover(&world, &wcomm, target_workers, &is_worker, &wsize, &wrank,
+                ckpt_path, &N, &pivot_i, &A_local, &row_start, &row_count);
+        if (!is_worker) break;
+        free(pivot_row);
+        pivot_row = (float*)malloc((size_t)(N + 1) * sizeof(float));
+        continue;
+      }
+
+      ckpt_write(wcomm, ckpt_path, N, next_p, A_local, row_start, row_count);
+      pivot_i = next_p;
+    }
+
+    free(pivot_row);
+
+    /* Gather full matrix to worker rank 0 and do back substitution */
+    int *rcounts = NULL, *displs = NULL;
+    float *A_full = NULL;
+
+    if (wrank == 0) {
+      rcounts = (int*)malloc((size_t)wsize * sizeof(int));
+      displs  = (int*)malloc((size_t)wsize * sizeof(int));
+      if (!rcounts || !displs) die("alloc gather arrays failed");
+    }
+
+    int sendcount = row_count * (N + 1);
+    int rc = MPI_Gather(&sendcount, 1, MPI_INT, rcounts, 1, MPI_INT, 0, wcomm);
+    if (rc != MPI_SUCCESS) die("MPI_Gather failed");
+
+    if (wrank == 0) {
+      int disp = 0;
+      for (int i = 0; i < wsize; i++) {
+        displs[i] = disp;
+        disp += rcounts[i];
+      }
+      A_full = (float*)malloc((size_t)disp * sizeof(float));
+      if (!A_full) die("alloc A_full failed");
+    }
+
+    rc = MPI_Gatherv(A_local, sendcount, MPI_FLOAT,
+                     A_full, rcounts, displs, MPI_FLOAT, 0, wcomm);
+    if (rc != MPI_SUCCESS) die("MPI_Gatherv failed");
+
+    if (wrank == 0) {
+      float *X = (float*)malloc((size_t)N * sizeof(float));
+      if (!X) die("alloc X failed");
+
+      /* A_full is row-major augmented matrix */
+      #define AF(i,j) A_full[(i)*(N+1)+(j)]
+
+      X[N-1] = AF(N-1, N) / AF(N-1, N-1);
+      for (int j = N - 2; j >= 0; j--) {
+        for (int k = 0; k <= j; k++) {
+          AF(k, N) = AF(k, N) - AF(k, j + 1) * X[j + 1];
+        }
+        X[j] = AF(j, N) / AF(j, j);
+      }
+
+      printf("DONE. First X entries: ");
+      for (int i = 0; i < (N > 9 ? 9 : N); i++) {
+        printf("%.4g%s", X[i], (i % 10 == 9) ? "\n" : ", ");
+      }
+      printf("%s\n", (N > 9) ? "..." : "");
+
+      free(X);
+      free(A_full);
+      free(rcounts);
+      free(displs);
+    }
+
+    free(A_local);
+    MPI_Comm_free(&wcomm);
+  }
+
+  MPI_Finalize();
+  return 0;
+}
+
+
+Напоминаю про условие задания:
+
+Реализовать MPI-программу, используя параллельный ввод-вывод (MPI-IO), добавить контрольные точки для продолжения работы программы в случае сбоя. Реализовать один из 2-х сценариев работы после сбоя: 
+ - a) при запуске программы на счет сразу запустить некоторое дополнительное количество MPI-процессов, которые использовать в случае сбоя; 
+ - б) вместо процессов, вышедших из строя, создать новые MPI-процессы, которые необходимо использовать для продолжения расчетов.
+
+Вот исходная программа по методу Гаусса:
+
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/time.h>
+
+void prt1a(char *t1, float *v, int n,char *t2);
+void wtime(double *t) {
+	static int sec = -1;
+	struct timeval tv;
+	gettimeofday(&tv, (void *)0);
+	if (sec < 0) sec = tv.tv_sec;
+	*t = (tv.tv_sec - sec) + 1.0e-6*tv.tv_usec;
+}
+
+int N;
+float *A;
+#define A(i,j) A[(i)*(N+1)+(j)]
+float *X;
+
+int main(int argc,char **argv) {
+	double time0, time1;
+	FILE *in;
+	int i, j, k;
+	in=fopen("data.in","r");
+	if(in==NULL) {
+		printf("Can not open 'data.in' "); exit(1);
+	}
+	i=fscanf(in,"%d", &N);
+	if(i<1) {
+		printf("Wrong 'data.in' (N ...)"); exit(2);
+	}
+	/* create arrays */
+	A=(float *)malloc(N*(N+1)*sizeof(float));
+	X=(float *)malloc(N*sizeof(float));
+	printf("GAUSS %dx%d\n----------------------------------\n",N,N);
+	/* initialize array A*/
+	for(i=0; i <= N-1; i++)
+		for(j=0; j <= N; j++)
+			if (i==j || j==N)
+				A(i,j) = 1.f;
+			else 
+				A(i,j)=0.f;
+	wtime(&time0);
+	
+	/* elimination */
+	for (i=0; i<N-1; i++) {
+		for (k=i+1; k <= N-1; k++)
+			for (j=i+1; j <= N; j++)
+				A(k,j) = A(k,j)-A(k,i)*A(i,j)/A(i,i);
+	}
+
+	/* reverse substitution */
+	X[N-1] = A(N-1,N)/A(N-1,N-1);
+	for (j=N-2; j>=0; j--) {
+		for (k=0; k <= j; k++)
+			A(k,N) = A(k,N)-A(k,j+1)*X[j+1];
+		X[j]=A(j,N)/A(j,j);
+	}
+	wtime(&time1);
+	printf("Time in seconds=%gs\n",time1-time0);
+	prt1a("X=(", X,N>9?9:N,"...)\n");
+	free(A);
+	free(X);
+	return 0;
+}
+
+void prt1a(char * t1, float *v, int n,char *t2) {
+	int j;
+	printf("%s",t1);
+	for(j=0;j<n;j++)
+		printf("%.4g%s",v[j], j%10==9? "\n": ", ");
+	printf("%s",t2);
+}
+
+

@@ -1,0 +1,15 @@
+alexgud@alexgud-NBD-WXX9:~/study/msu/kurs4/distributed_systems/MSU_CMC_2025_Distributed_systems/task2/code$ make run
+/home/alexgud/opt/openmpi-ulfm-api/bin/mpirun --oversubscribe --with-ft ulfm --mca io ompio -np 6 ./gauss_ft_mpiio
+--------------------------------------------------------------------------
+WARNING: The selected 'io' module 'ompio' is not tested for post-failure
+operation, yet you have requested support for fault tolerance.
+When using this component, normal failure free operation is expected;
+However, failures may cause the application to abort, crash or deadlock.
+
+In this framework, the following components are tested to operate under
+failure scenarios: {}
+--------------------------------------------------------------------------
+1187 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+1213 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+1278 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
+1314 more processes have sent help message help-mpi-ft.txt / module:untested:failundef
