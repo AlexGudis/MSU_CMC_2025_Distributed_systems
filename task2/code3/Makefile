@@ -12,7 +12,7 @@ LDFLAGS :=
 TARGET := gauss_spares_ft
 SRC    := gauss_spares_ft.c
 
-WORK   := 6
+WORK   := 4
 SPARES := 2
 NP     := $(shell echo $$(( $(WORK) + $(SPARES) )) )
 
