@@ -1,5 +1,5 @@
 #include <mpi.h>
-#include <mpi-ext.h>   // ULFM: MPIX_Comm_revoke, MPIX_Comm_shrink, MPIX_ERR_*
+#include <mpi-ext.h> 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,8 +9,8 @@
 enum { PH_ELIM = 0, PH_BACK = 1 };
 
 typedef struct {
-  int magic;   // 'GUSS' = 0x47555353
-  int version; // 1
+  int magic;
+  int version;
   int N;
   int phase;
   int step;
@@ -155,7 +155,6 @@ static int checkpoint_save(MPI_Comm active, const char* path,
   if (rc != MPI_SUCCESS) { if (Afull) free(Afull); return rc; }
 
   if (arank == 0) {
-    // log0(active, "CKPT_SAVE: phase=%d step=%d", phase, step);
     ckpt_write_root_self(path, N, phase, step, Afull);
     free(Afull);
   }
@@ -178,7 +177,6 @@ static int checkpoint_load(MPI_Comm active, const char* path,
     if (!Afull) die("malloc Afull failed(load)");
     int ok = ckpt_read_root_self(path, &N0, &ph0, &st0, Afull);
     if (!ok) die("Checkpoint missing on load");
-    // log0(active, "CKPT_LOAD: N=%d phase=%d step=%d", N0, ph0, st0);
   }
 
   int rc = MPI_Bcast(&N0, 1, MPI_INT, 0, active);
@@ -197,7 +195,31 @@ static int checkpoint_load(MPI_Comm active, const char* path,
   return rc;
 }
 
-// ---------------- Gauss (ACTIVE). Returns MPI error if any collective fails ----------------
+// ---------------- ACTIVE allocation/rebuild  ----------------
+static void active_alloc_rebuild(MPI_Comm active, int N,
+                                 int* row0, int* nloc,
+                                 float** Aloc,
+                                 int** counts, int** displs) {
+  int asize, arank;
+  MPI_Comm_size(active, &asize);
+  MPI_Comm_rank(active, &arank);
+
+  block_decomp(N, asize, arank, row0, nloc);
+
+  free(*Aloc);
+  *Aloc = (float*)malloc((size_t)(*nloc) * (size_t)(N + 1) * sizeof(float));
+  if (!*Aloc) die("malloc Aloc failed");
+
+  free(*counts);
+  free(*displs);
+  *counts = (int*)malloc((size_t)asize * sizeof(int));
+  *displs = (int*)malloc((size_t)asize * sizeof(int));
+  if (!*counts || !*displs) die("malloc counts/displs failed");
+
+  make_counts_displs(N, asize, *counts, *displs);
+}
+
+// ---------------- Gauss (ACTIVE).  ----------------
 static int gauss_run(MPI_Comm active, int N,
                      int* phase_io, int* step_io,
                      int row0, int nloc, float* A,
@@ -230,10 +252,13 @@ static int gauss_run(MPI_Comm active, int N,
       *last_phase = PH_ELIM; *last_step = i;
 
       if (world_rank == fail_rank && fail_phase == PH_ELIM && fail_step == i) {
-        // log0(active, "INJECT_FAIL: world_rank=%d phase=ELIM step=%d", world_rank, i);
+        fprintf(stderr,
+        "KILLING myself: world_rank=%d pid=%d phase=%d step=%d\n",
+        world_rank, getpid(), phase, i);
+        fflush(stderr);
         raise(SIGKILL);
       }
-
+        
       int owner = owner_of_row(N, asize, i);
       if (arank == owner) {
         int li = i - row0;
@@ -253,14 +278,16 @@ static int gauss_run(MPI_Comm active, int N,
         }
       }
 
+      // safe checkpoint only in ELIM (A is sufficient state here)
       if (ckpt_period > 0 && (i % ckpt_period == 0)) {
         rc = checkpoint_save(active, ckpt_path, N, PH_ELIM, i + 1, A, nloc, counts, displs);
         if (rc != MPI_SUCCESS) { free(pivot); return rc; }
       }
     }
 
+    // switch to back-substitution, make a boundary checkpoint
     phase = PH_BACK;
-    step = N - 2;
+    step  = N - 2;
     {
       int rc = checkpoint_save(active, ckpt_path, N, phase, step, A, nloc, counts, displs);
       if (rc != MPI_SUCCESS) { free(pivot); return rc; }
@@ -268,6 +295,7 @@ static int gauss_run(MPI_Comm active, int N,
   }
 
   // back substitution
+  // NOTE: no checkpoints inside BACK
   float* X = (float*)calloc((size_t)N, sizeof(float));
   if (!X) die("calloc X failed");
 
@@ -302,11 +330,6 @@ static int gauss_run(MPI_Comm active, int N,
 
     rc = MPI_Bcast(&X[j], 1, MPI_FLOAT, owner, active);
     if (rc != MPI_SUCCESS) { free(X); free(pivot); return rc; }
-
-    if (ckpt_period > 0 && (j % ckpt_period == 0)) {
-      rc = checkpoint_save(active, ckpt_path, N, PH_BACK, j - 1, A, nloc, counts, displs);
-      if (rc != MPI_SUCCESS) { free(X); free(pivot); return rc; }
-    }
   }
 
   if (arank == 0) {
@@ -394,29 +417,9 @@ int main(int argc, char** argv) {
   int* counts = NULL;
   int* displs = NULL;
 
-  // allocate/reallocate per ACTIVE size
-  void active_alloc_rebuild(void) {
-    int asize, arank;
-    MPI_Comm_size(active, &asize);
-    MPI_Comm_rank(active, &arank);
-
-    block_decomp(N, asize, arank, &row0, &nloc);
-
-    free(Aloc);
-    Aloc = (float*)malloc((size_t)nloc * (size_t)(N + 1) * sizeof(float));
-    if (!Aloc) die("malloc Aloc failed");
-
-    free(counts);
-    free(displs);
-    counts = (int*)malloc((size_t)asize * sizeof(int));
-    displs = (int*)malloc((size_t)asize * sizeof(int));
-    if (!counts || !displs) die("malloc counts/displs failed");
-    make_counts_displs(N, asize, counts, displs);
-  }
-
   // init + initial checkpoint
   if (active != MPI_COMM_NULL) {
-    active_alloc_rebuild();
+    active_alloc_rebuild(active, N, &row0, &nloc, &Aloc, &counts, &displs);
 
     for (int lk = 0; lk < nloc; lk++) {
       int i = row0 + lk;
@@ -444,7 +447,6 @@ int main(int argc, char** argv) {
 
       if (active_rc != MPI_SUCCESS) {
         if (is_ulfm_failure(active_rc)) {
-          // minimal info: who noticed + where we were
           log0(world, "FAIL noticed by old_world_rank=%d at phase=%d step=%d -> revoke",
                old_world_rank, last_phase, last_step);
           MPIX_Comm_revoke(world);
@@ -499,15 +501,11 @@ int main(int argc, char** argv) {
 
     if (active != MPI_COMM_NULL) {
       MPI_Comm_set_errhandler(active, MPI_ERRORS_RETURN);
-      active_alloc_rebuild();
+      active_alloc_rebuild(active, N, &row0, &nloc, &Aloc, &counts, &displs);
 
-      // reload from checkpoint
+      // reload from checkpoint (always safe now: either ELIM with A, or BACK boundary checkpoint)
       rc = checkpoint_load(active, ckpt_path, &N, &phase, &step, Aloc, nloc, counts, displs);
       if (rc != MPI_SUCCESS) die_mpi("checkpoint_load after recovery", rc);
-
-      int ar;
-      MPI_Comm_rank(active, &ar);
-      // if (ar == 0) log0(active, "RESUME: phase=%d step=%d", phase, step);
     }
   }
 

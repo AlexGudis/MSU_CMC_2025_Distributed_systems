@@ -19,7 +19,7 @@ NP     := $(shell echo $$(( $(WORK) + $(SPARES) )) )
 CKPT := /tmp/gauss_spares.ckpt
 
 # normal run (no FT framework)
-RUNOPTS := --oversubscribe --mca io ompio
+RUNOPTS := --oversubscribe --mca io ompio --mca state_base_verbose 10 --mca plm_base_verbose 10
 
 # FT run:
 # - enable ULFM
@@ -28,7 +28,7 @@ RUNOPTS := --oversubscribe --mca io ompio
 # - disable help aggregation for clearer logs
 RUNOPTS_FT := --oversubscribe --with-ft ulfm --mca io ompio \
              --mca coll ^han,ucc,tuned \
-             --mca orte_base_help_aggregate 0
+             --mca orte_base_help_aggregate 1
 
 .PHONY: all run run_ft fail_ft info clean
 
@@ -36,9 +36,6 @@ all: $(TARGET)
 
 $(TARGET): $(SRC)
 	$(MPICC) $(CFLAGS) -o $@ $< $(LDFLAGS)
-
-run: $(TARGET)
-	$(MPIRUN) $(RUNOPTS) -np $(NP) ./$(TARGET) data.in $(CKPT) $(WORK)
 
 run_ft: $(TARGET)
 	$(MPIRUN) $(RUNOPTS_FT) -np $(NP) ./$(TARGET) data.in $(CKPT) $(WORK)
