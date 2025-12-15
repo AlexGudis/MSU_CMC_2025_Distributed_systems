@@ -1,14 +1,10 @@
-#define _GNU_SOURCE
 #include <mpi.h>
+#include <mpi-ext.h>   // ULFM: MPIX_Comm_revoke, MPIX_Comm_shrink, MPIX_ERR_*
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <stdarg.h>
-
-#ifdef USE_ULFM
-#include <mpi-ext.h>
-#endif
 
 enum { PH_ELIM = 0, PH_BACK = 1 };
 
@@ -20,25 +16,21 @@ typedef struct {
   int step;
 } ckpt_hdr;
 
-// ---------------- debug ----------------
-static int DBG = 1;          // env GAUSS_DBG (0/1)
-static int DBG_EVERY = 50;   // env GAUSS_DBG_EVERY
+// ---------------- logging ----------------
+static int LOG = 1; // env GAUSS_LOG=0 выключает лог
 
-static void dbg_init(void) {
-  const char* s;
-  if ((s = getenv("GAUSS_DBG"))) DBG = atoi(s);
-  if ((s = getenv("GAUSS_DBG_EVERY"))) DBG_EVERY = atoi(s);
-  if (DBG_EVERY <= 0) DBG_EVERY = 50;
+static void log_init(void) {
+  const char* s = getenv("GAUSS_LOG");
+  if (s) LOG = atoi(s);
 }
 
-static void dbg_printf(MPI_Comm comm, const char* fmt, ...) {
-  if (!DBG) return;
+static void log0(MPI_Comm comm, const char* fmt, ...) {
+  if (!LOG) return;
   int r = -1;
   if (comm != MPI_COMM_NULL) MPI_Comm_rank(comm, &r);
   double t = MPI_Wtime();
-  fprintf(stderr, "[t=%9.3f r=%d] ", t, r);
-  va_list ap;
-  va_start(ap, fmt);
+  fprintf(stderr, "[t=%8.3f r=%d] ", t, r);
+  va_list ap; va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
   va_end(ap);
   fprintf(stderr, "\n");
@@ -61,16 +53,14 @@ static void die_mpi(const char* where, int rc) {
   MPI_Abort(MPI_COMM_WORLD, 2);
 }
 
-#ifdef USE_ULFM
 static int is_ulfm_failure(int rc) {
   if (rc == MPI_SUCCESS) return 0;
   int eclass = MPI_ERR_OTHER;
   MPI_Error_class(rc, &eclass);
   return (eclass == MPIX_ERR_PROC_FAILED || eclass == MPIX_ERR_REVOKED);
 }
-#endif
 
-// ---------- distribution ----------
+// ---------------- distribution ----------------
 static void block_decomp(int N, int P, int r, int* r0, int* rn) {
   int base = N / P, rem = N % P;
   int nloc = base + (r < rem ? 1 : 0);
@@ -97,7 +87,7 @@ static void make_counts_displs(int N, int P, int* counts, int* displs) {
   }
 }
 
-// ---------- MPI-IO checkpoint (rank0 of ACTIVE only, via MPI_COMM_SELF) ----------
+// ---------------- MPI-IO checkpoint (rank0 ACTIVE only, MPI_COMM_SELF) ----------------
 static void ckpt_write_root_self(const char* path, int N, int phase, int step, const float* Afull) {
   MPI_File fh;
   int rc = MPI_File_open(MPI_COMM_SELF, path,
@@ -146,15 +136,13 @@ static int ckpt_read_root_self(const char* path, int* N, int* phase, int* step, 
   return 1;
 }
 
-// ---------- Checkpoint save/load over ACTIVE communicator ----------
+// ---------------- checkpoint save/load over ACTIVE ----------------
 static int checkpoint_save(MPI_Comm active, const char* path,
                            int N, int phase, int step,
                            const float* Aloc, int nloc,
                            int* counts, int* displs) {
   int arank;
   MPI_Comm_rank(active, &arank);
-
-  // if (DBG && arank == 0) dbg_printf(active, "CKPT_SAVE start: phase=%d step=%d", phase, step);
 
   float* Afull = NULL;
   if (arank == 0) {
@@ -167,13 +155,12 @@ static int checkpoint_save(MPI_Comm active, const char* path,
   if (rc != MPI_SUCCESS) { if (Afull) free(Afull); return rc; }
 
   if (arank == 0) {
+    // log0(active, "CKPT_SAVE: phase=%d step=%d", phase, step);
     ckpt_write_root_self(path, N, phase, step, Afull);
     free(Afull);
   }
 
-  rc = MPI_Barrier(active);
-  // if (DBG && arank == 0 && rc == MPI_SUCCESS) dbg_printf(active, "CKPT_SAVE done : phase=%d step=%d", phase, step);
-  return rc;
+  return MPI_Barrier(active);
 }
 
 static int checkpoint_load(MPI_Comm active, const char* path,
@@ -191,7 +178,7 @@ static int checkpoint_load(MPI_Comm active, const char* path,
     if (!Afull) die("malloc Afull failed(load)");
     int ok = ckpt_read_root_self(path, &N0, &ph0, &st0, Afull);
     if (!ok) die("Checkpoint missing on load");
-    if (DBG) dbg_printf(active, "CKPT_LOAD read: N=%d phase=%d step=%d", N0, ph0, st0);
+    // log0(active, "CKPT_LOAD: N=%d phase=%d step=%d", N0, ph0, st0);
   }
 
   int rc = MPI_Bcast(&N0, 1, MPI_INT, 0, active);
@@ -207,16 +194,16 @@ static int checkpoint_load(MPI_Comm active, const char* path,
                     Aloc, nloc * (N0 + 1), MPI_FLOAT, 0, active);
 
   if (arank == 0) free(Afull);
-  if (DBG && arank == 0 && rc == MPI_SUCCESS) dbg_printf(active, "CKPT_LOAD scatter done");
   return rc;
 }
 
-// ---------- Gauss on ACTIVE communicator; returns MPI error code if any collective failed ----------
+// ---------------- Gauss (ACTIVE). Returns MPI error if any collective fails ----------------
 static int gauss_run(MPI_Comm active, int N,
                      int* phase_io, int* step_io,
                      int row0, int nloc, float* A,
                      const char* ckpt_path, int ckpt_period,
-                     int* counts, int* displs) {
+                     int* counts, int* displs,
+                     int* last_phase, int* last_step) {
   int arank, asize;
   MPI_Comm_rank(active, &arank);
   MPI_Comm_size(active, &asize);
@@ -224,7 +211,7 @@ static int gauss_run(MPI_Comm active, int N,
   int world_rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-  // Failure injection uses WORLD rank
+  // failure injection uses WORLD rank
   int fail_rank = -1, fail_step = -1, fail_phase = -1;
   const char* s;
   if ((s = getenv("FAIL_RANK")))  fail_rank  = atoi(s);
@@ -239,12 +226,11 @@ static int gauss_run(MPI_Comm active, int N,
 
   // elimination
   if (phase == PH_ELIM) {
-    if (DBG && arank == 0) dbg_printf(active, "ENTER ELIM: start_i=%d", step);
     for (int i = step; i < N - 1; i++) {
-      if (DBG && arank == 0 && (i % DBG_EVERY == 0)) dbg_printf(active, "ELIM progress: i=%d/%d", i, N - 1);
+      *last_phase = PH_ELIM; *last_step = i;
 
       if (world_rank == fail_rank && fail_phase == PH_ELIM && fail_step == i) {
-        dbg_printf(active, "INJECT FAIL: world_rank=%d at ELIM i=%d (SIGKILL)", world_rank, i);
+        // log0(active, "INJECT_FAIL: world_rank=%d phase=ELIM step=%d", world_rank, i);
         raise(SIGKILL);
       }
 
@@ -275,15 +261,13 @@ static int gauss_run(MPI_Comm active, int N,
 
     phase = PH_BACK;
     step = N - 2;
-    if (DBG && arank == 0) dbg_printf(active, "SWITCH -> BACK: start_j=%d", step);
-
-    int rc = checkpoint_save(active, ckpt_path, N, phase, step, A, nloc, counts, displs);
-    if (rc != MPI_SUCCESS) { free(pivot); return rc; }
+    {
+      int rc = checkpoint_save(active, ckpt_path, N, phase, step, A, nloc, counts, displs);
+      if (rc != MPI_SUCCESS) { free(pivot); return rc; }
+    }
   }
 
   // back substitution
-  if (DBG && arank == 0) dbg_printf(active, "ENTER BACK: start_j=%d", step);
-
   float* X = (float*)calloc((size_t)N, sizeof(float));
   if (!X) die("calloc X failed");
 
@@ -297,10 +281,10 @@ static int gauss_run(MPI_Comm active, int N,
   if (rc != MPI_SUCCESS) { free(X); free(pivot); return rc; }
 
   for (int j = step; j >= 0; j--) {
-    if (DBG && arank == 0 && (j % DBG_EVERY == 0)) dbg_printf(active, "BACK progress: j=%d", j);
+    *last_phase = PH_BACK; *last_step = j;
 
     if (world_rank == fail_rank && fail_phase == PH_BACK && fail_step == j) {
-      dbg_printf(active, "INJECT FAIL: world_rank=%d at BACK j=%d (SIGKILL)", world_rank, j);
+      log0(active, "INJECT_FAIL: world_rank=%d phase=BACK step=%d", world_rank, j);
       raise(SIGKILL);
     }
 
@@ -328,7 +312,7 @@ static int gauss_run(MPI_Comm active, int N,
   if (arank == 0) {
     printf("X=(");
     int m = (N > 9 ? 9 : N);
-    for (int i = 0; i < m; i++) printf("%.4g%s", X[i], (i % 10 == 9 ? "\n": ", "));
+    for (int i = 0; i < m; i++) printf("%.4g%s", X[i], (i % 10 == 9 ? "\n" : ", "));
     printf("...)\n");
     fflush(stdout);
   }
@@ -348,24 +332,12 @@ static MPI_Comm build_active_from_world(MPI_Comm world_comm, int WORK) {
   int rc = MPI_Comm_split(world_comm, color, wrank, &active);
   if (rc != MPI_SUCCESS) die_mpi("MPI_Comm_split(active)", rc);
 
-  if (DBG) {
-    if (active != MPI_COMM_NULL) {
-      int ar, as;
-      MPI_Comm_rank(active, &ar);
-      MPI_Comm_size(active, &as);
-      dbg_printf(world_comm, "ACTIVE formed: world_rank=%d -> active_rank=%d, active_size=%d (WORK=%d)",
-                 wrank, ar, as, WORK);
-    } else {
-      dbg_printf(world_comm, "SPARE/IDLE: world_rank=%d not in ACTIVE (WORK=%d)", wrank, WORK);
-    }
-  }
-
   return active;
 }
 
 int main(int argc, char** argv) {
   MPI_Init(&argc, &argv);
-  dbg_init();
+  log_init();
 
   MPI_Comm world = MPI_COMM_WORLD;
   MPI_Comm_set_errhandler(world, MPI_ERRORS_RETURN);
@@ -374,13 +346,10 @@ int main(int argc, char** argv) {
   MPI_Comm_rank(world, &world_rank);
   MPI_Comm_size(world, &world_size);
 
-  // keep "old world rank" for recovery report (remains constant for a process)
   int old_world_rank = world_rank;
 
   if (argc < 4) {
-    if (world_rank == 0) {
-      fprintf(stderr, "Usage: %s data.in ckpt_path WORK\n", argv[0]);
-    }
+    if (world_rank == 0) fprintf(stderr, "Usage: %s data.in ckpt_path WORK\n", argv[0]);
     MPI_Finalize();
     return 1;
   }
@@ -390,17 +359,17 @@ int main(int argc, char** argv) {
   int WORK = atoi(argv[3]);
   if (WORK <= 0 || WORK > world_size) die("Bad WORK value");
 
-  dbg_printf(world, "START: world_size=%d, WORK=%d, SPARES=%d",
-             world_size, WORK, world_size - WORK);
+  if (world_rank == 0) {
+    log0(world, "START: world_size=%d WORK=%d SPARES=%d", world_size, WORK, world_size - WORK);
+  }
 
-  // Build initial ACTIVE set from WORLD
   MPI_Comm active = build_active_from_world(world, WORK);
   if (active != MPI_COMM_NULL) MPI_Comm_set_errhandler(active, MPI_ERRORS_RETURN);
 
   int N = 0, phase = PH_ELIM, step = 0;
   int ckpt_period = 2;
 
-  // ACTIVE rank0 reads N and broadcasts inside ACTIVE
+  // active rank0 reads N
   if (active != MPI_COMM_NULL) {
     int arank;
     MPI_Comm_rank(active, &arank);
@@ -409,23 +378,23 @@ int main(int argc, char** argv) {
       if (!in) die("Cannot open data.in");
       if (fscanf(in, "%d", &N) != 1) die("Wrong data.in");
       fclose(in);
-      dbg_printf(active, "READ N=%d from %s", N, in_path);
+      log0(active, "READ N=%d", N);
     }
     int rc = MPI_Bcast(&N, 1, MPI_INT, 0, active);
     if (rc != MPI_SUCCESS) die_mpi("MPI_Bcast(N)", rc);
   }
 
-  // Broadcast N to all WORLD so spares know sizes after rebuilds
+  // N to whole world (spares need it after rebuild)
   int rc = MPI_Bcast(&N, 1, MPI_INT, 0, world);
   if (rc != MPI_SUCCESS) die_mpi("MPI_Bcast(N,world)", rc);
 
-  // Buffers for ACTIVE only
+  // ACTIVE buffers
   float* Aloc = NULL;
   int row0 = 0, nloc = 0;
   int* counts = NULL;
   int* displs = NULL;
 
-  // Helper: (re)allocate per ACTIVE size
+  // allocate/reallocate per ACTIVE size
   void active_alloc_rebuild(void) {
     int asize, arank;
     MPI_Comm_size(active, &asize);
@@ -443,19 +412,16 @@ int main(int argc, char** argv) {
     displs = (int*)malloc((size_t)asize * sizeof(int));
     if (!counts || !displs) die("malloc counts/displs failed");
     make_counts_displs(N, asize, counts, displs);
-
-    if (DBG) dbg_printf(active, "ACTIVE alloc: asize=%d row0=%d nloc=%d", asize, row0, nloc);
   }
 
-  // Initial init + initial checkpoint (ACTIVE only)
+  // init + initial checkpoint
   if (active != MPI_COMM_NULL) {
     active_alloc_rebuild();
 
     for (int lk = 0; lk < nloc; lk++) {
       int i = row0 + lk;
       for (int j = 0; j <= N; j++) {
-        float v = (i == j || j == N) ? 1.f : 0.f;
-        Aloc[lk * (N + 1) + j] = v;
+        Aloc[lk * (N + 1) + j] = (i == j || j == N) ? 1.f : 0.f;
       }
     }
 
@@ -465,47 +431,35 @@ int main(int argc, char** argv) {
 
   double t0 = MPI_Wtime();
 
+  int last_phase = PH_ELIM;
+  int last_step  = 0;
+
   while (1) {
     int active_rc = MPI_SUCCESS;
 
-    // ACTIVE computes, SPARES do not
     if (active != MPI_COMM_NULL) {
       active_rc = gauss_run(active, N, &phase, &step, row0, nloc, Aloc,
-                            ckpt_path, ckpt_period, counts, displs);
+                            ckpt_path, ckpt_period, counts, displs,
+                            &last_phase, &last_step);
 
-#ifdef USE_ULFM
       if (active_rc != MPI_SUCCESS) {
         if (is_ulfm_failure(active_rc)) {
-          dbg_printf(world, "FAIL detected in ACTIVE (old_world_rank=%d). Calling MPIX_Comm_revoke(WORLD)", old_world_rank);
+          // minimal info: who noticed + where we were
+          log0(world, "FAIL noticed by old_world_rank=%d at phase=%d step=%d -> revoke",
+               old_world_rank, last_phase, last_step);
           MPIX_Comm_revoke(world);
         } else {
-          dbg_printf(world, "MPI error in ACTIVE (not ULFM failure), rc=%d -> abort", active_rc);
-          MPI_Abort(MPI_COMM_WORLD, 3);
+          die_mpi("MPI error in ACTIVE (not ULFM failure)", active_rc);
         }
       }
-#else
-      if (active_rc != MPI_SUCCESS) {
-        dbg_printf(world, "MPI error in ACTIVE but USE_ULFM off, rc=%d -> abort", active_rc);
-        MPI_Abort(MPI_COMM_WORLD, 3);
-      }
-#endif
     }
 
-    // Everyone syncs on WORLD barrier.
     rc = MPI_Barrier(world);
-    if (rc == MPI_SUCCESS) {
-      if (DBG && world_rank == 0) dbg_printf(world, "WORLD barrier OK -> finish");
-      break;
-    }
+    if (rc == MPI_SUCCESS) break;
 
-#ifndef USE_ULFM
-    die_mpi("WORLD barrier failed but USE_ULFM off", rc);
-#else
-    if (!is_ulfm_failure(rc)) die_mpi("WORLD barrier failed (not ULFM failure)", rc);
+    if (!is_ulfm_failure(rc)) die_mpi("WORLD barrier failed (not ULFM)", rc);
 
-    dbg_printf(world, "WORLD barrier returned error -> start recovery (shrink)");
-
-    // All survivors shrink WORLD
+    // shrink on all survivors
     MPI_Comm world2;
     MPIX_Comm_shrink(world, &world2);
     world = world2;
@@ -514,58 +468,54 @@ int main(int argc, char** argv) {
     int new_wr, new_ws;
     MPI_Comm_rank(world, &new_wr);
     MPI_Comm_size(world, &new_ws);
-    dbg_printf(world, "SHRINK done. New WORLD size=%d, my new world_rank=%d (my old_world_rank=%d)",
-               new_ws, new_wr, old_world_rank);
 
-    // Recovery report: list survivors by old world rank; show new ACTIVE membership
+    // recovery report on new world rank0
     {
-      int my_old = old_world_rank;
       int* surv_old = NULL;
       if (new_wr == 0) surv_old = (int*)malloc((size_t)new_ws * sizeof(int));
 
-      MPI_Gather(&my_old, 1, MPI_INT, surv_old, 1, MPI_INT, 0, world);
+      MPI_Gather(&old_world_rank, 1, MPI_INT, surv_old, 1, MPI_INT, 0, world);
 
       if (new_wr == 0) {
-        fprintf(stderr, "=== RECOVERY REPORT ===\n");
-        fprintf(stderr, "Survivors old world ranks (new order): ");
-        for (int i = 0; i < new_ws; i++) fprintf(stderr, "%d%s", surv_old[i], (i + 1 == new_ws ? "\n" : " "));
-        fprintf(stderr, "New ACTIVE old world ranks: ");
+        fprintf(stderr, "=== RECOVERY ===\n");
+        fprintf(stderr, "Survivors(old world ranks): ");
+        for (int i = 0; i < new_ws; i++) fprintf(stderr, "%d%s", surv_old[i], (i+1==new_ws? "\n" : " "));
+        fprintf(stderr, "New ACTIVE(old ranks): ");
         int act = (WORK < new_ws ? WORK : new_ws);
-        for (int i = 0; i < act; i++) fprintf(stderr, "%d%s", surv_old[i], (i + 1 == act ? "\n" : " "));
-        fprintf(stderr, "=======================\n");
+        for (int i = 0; i < act; i++) fprintf(stderr, "%d%s", surv_old[i], (i+1==act? "\n" : " "));
+        fprintf(stderr, "==============\n");
         fflush(stderr);
         free(surv_old);
       }
     }
 
-    // Broadcast N within new WORLD (rank 0 of new world)
+    // N to new world
     rc = MPI_Bcast(&N, 1, MPI_INT, 0, world);
     if (rc != MPI_SUCCESS) die_mpi("MPI_Bcast(N after shrink)", rc);
 
-    // Rebuild ACTIVE from new WORLD
+    // rebuild active
     if (active != MPI_COMM_NULL) MPI_Comm_free(&active);
     active = build_active_from_world(world, WORK);
+
     if (active != MPI_COMM_NULL) {
       MPI_Comm_set_errhandler(active, MPI_ERRORS_RETURN);
       active_alloc_rebuild();
 
-      // Load checkpoint and continue
+      // reload from checkpoint
       rc = checkpoint_load(active, ckpt_path, &N, &phase, &step, Aloc, nloc, counts, displs);
-      if (rc != MPI_SUCCESS) die_mpi("checkpoint_load after rebuild", rc);
+      if (rc != MPI_SUCCESS) die_mpi("checkpoint_load after recovery", rc);
 
-      dbg_printf(active, "RECOVERY complete -> resume: phase=%d step=%d", phase, step);
-    } else {
-      // This rank is spare/idle in new configuration; it still participates in WORLD barrier each loop
-      dbg_printf(world, "Now SPARE/IDLE after recovery (old_world_rank=%d)", old_world_rank);
+      int ar;
+      MPI_Comm_rank(active, &ar);
+      // if (ar == 0) log0(active, "RESUME: phase=%d step=%d", phase, step);
     }
-#endif
   }
 
   double t1 = MPI_Wtime();
   if (active != MPI_COMM_NULL) {
-    int arank;
-    MPI_Comm_rank(active, &arank);
-    if (arank == 0) printf("Time in seconds=%gs\n", (t1 - t0));
+    int ar;
+    MPI_Comm_rank(active, &ar);
+    if (ar == 0) printf("Time in seconds=%gs\n", (t1 - t0));
   }
 
   free(Aloc);

@@ -6,7 +6,7 @@ OMPI_PREFIX := $(HOME)/opt/openmpi-ulfm-api
 MPICC       := $(OMPI_PREFIX)/bin/mpicc
 MPIRUN      := $(OMPI_PREFIX)/bin/mpirun
 
-CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wpedantic -DUSE_ULFM
+CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS :=
 
 TARGET := gauss_spares_ft
