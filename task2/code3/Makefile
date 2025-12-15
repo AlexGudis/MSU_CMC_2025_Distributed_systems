@@ -9,8 +9,8 @@ MPIRUN      := $(OMPI_PREFIX)/bin/mpirun
 CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS :=
 
-TARGET := gauss_spares_ft
-SRC    := gauss_spares_ft.c
+TARGET := gauss_scenario_a
+SRC    := gauss_scenario_a.c
 
 WORK   := 4
 SPARES := 2
