@@ -1,16 +1,17 @@
 #include <mpi.h>
-#include <mpi-ext.h> 
+#include <mpi-ext.h>   // ULFM: MPIX_Comm_revoke, MPIX_Comm_shrink, MPIX_ERR_*
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <unistd.h>    // getpid
 
 enum { PH_ELIM = 0, PH_BACK = 1 };
 
 typedef struct {
-  int magic;
-  int version;
+  int magic;   // 'GUSS' = 0x47555353
+  int version; // 1
   int N;
   int phase;
   int step;
@@ -76,130 +77,134 @@ static int owner_of_row(int N, int P, int row) {
   return rem + (row - cut) / base;
 }
 
-static void make_counts_displs(int N, int P, int* counts, int* displs) {
-  int off = 0;
-  for (int r = 0; r < P; r++) {
-    int r0, rn;
-    block_decomp(N, P, r, &r0, &rn);
-    counts[r] = rn * (N + 1);
-    displs[r] = off;
-    off += counts[r];
-  }
-}
+// ---------------- PARALLEL MPI-IO checkpoint (ACTIVE communicator) ----------------
+// File layout:
+// [ckpt_hdr][A row 0 floats][A row 1 floats] ... [A row N-1 floats]
+// Each ACTIVE rank writes/reads its local block of rows directly.
+// No gather/scatter.
 
-// ---------------- MPI-IO checkpoint (rank0 ACTIVE only, MPI_COMM_SELF) ----------------
-static void ckpt_write_root_self(const char* path, int N, int phase, int step, const float* Afull) {
+static int ckpt_write_parallel(MPI_Comm active, const char* path,
+                               int N, int phase, int step,
+                               int row0, int nloc,
+                               const float* Aloc) {
   MPI_File fh;
-  int rc = MPI_File_open(MPI_COMM_SELF, path,
+  int rc = MPI_File_open(active, path,
                          MPI_MODE_CREATE | MPI_MODE_WRONLY,
                          MPI_INFO_NULL, &fh);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_open(write,self)", rc);
+  if (rc != MPI_SUCCESS) return rc;
 
-  ckpt_hdr h = {0};
-  h.magic = 0x47555353;
-  h.version = 1;
-  h.N = N;
-  h.phase = phase;
-  h.step = step;
-
-  rc = MPI_File_write_at(fh, 0, &h, (int)sizeof(h), MPI_BYTE, MPI_STATUS_IGNORE);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_write_at(header)", rc);
-
-  MPI_Offset off = (MPI_Offset)sizeof(h);
-  rc = MPI_File_write_at(fh, off, (void*)Afull, N * (N + 1), MPI_FLOAT, MPI_STATUS_IGNORE);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_write_at(matrix)", rc);
-
-  rc = MPI_File_close(&fh);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_close(write)", rc);
-}
-
-static int ckpt_read_root_self(const char* path, int* N, int* phase, int* step, float* Afull) {
-  MPI_File fh;
-  int rc = MPI_File_open(MPI_COMM_SELF, path, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
-  if (rc != MPI_SUCCESS) return 0;
-
-  ckpt_hdr h = {0};
-  rc = MPI_File_read_at(fh, 0, &h, (int)sizeof(h), MPI_BYTE, MPI_STATUS_IGNORE);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_read_at(header)", rc);
-
-  if (h.magic != 0x47555353 || h.version != 1) die("Checkpoint format error");
-
-  *N = h.N; *phase = h.phase; *step = h.step;
-
-  MPI_Offset off = (MPI_Offset)sizeof(h);
-  rc = MPI_File_read_at(fh, off, Afull, h.N * (h.N + 1), MPI_FLOAT, MPI_STATUS_IGNORE);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_read_at(matrix)", rc);
-
-  rc = MPI_File_close(&fh);
-  if (rc != MPI_SUCCESS) die_mpi("MPI_File_close(read)", rc);
-
-  return 1;
-}
-
-// ---------------- checkpoint save/load over ACTIVE ----------------
-static int checkpoint_save(MPI_Comm active, const char* path,
-                           int N, int phase, int step,
-                           const float* Aloc, int nloc,
-                           int* counts, int* displs) {
   int arank;
   MPI_Comm_rank(active, &arank);
 
-  float* Afull = NULL;
+  // rank0 writes header (non-collective write_at is OK)
   if (arank == 0) {
-    Afull = (float*)malloc((size_t)N * (size_t)(N + 1) * sizeof(float));
-    if (!Afull) die("malloc Afull failed");
+    ckpt_hdr h = {0};
+    h.magic = 0x47555353;
+    h.version = 1;
+    h.N = N;
+    h.phase = phase;
+    h.step = step;
+
+    rc = MPI_File_write_at(fh, 0, &h, (int)sizeof(h), MPI_BYTE, MPI_STATUS_IGNORE);
+    if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
   }
 
-  int rc = MPI_Gatherv((void*)Aloc, nloc * (N + 1), MPI_FLOAT,
-                       Afull, counts, displs, MPI_FLOAT, 0, active);
-  if (rc != MPI_SUCCESS) { if (Afull) free(Afull); return rc; }
+  // Ensure header write is completed/visible before proceeding
+  rc = MPI_Barrier(active);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
 
+  // IMPORTANT: MPI_File_set_size is COLLECTIVE on the file handle => call on ALL ranks
+  MPI_Offset total_bytes =
+    (MPI_Offset)sizeof(ckpt_hdr) +
+    (MPI_Offset)N * (MPI_Offset)(N + 1) * (MPI_Offset)sizeof(float);
+
+  rc = MPI_File_set_size(fh, total_bytes);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+
+  // Barrier before collective I/O
+  rc = MPI_Barrier(active);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+
+  // Each rank writes its local rows at the correct offset
+  MPI_Offset off =
+    (MPI_Offset)sizeof(ckpt_hdr) +
+    (MPI_Offset)row0 * (MPI_Offset)(N + 1) * (MPI_Offset)sizeof(float);
+
+  int count = nloc * (N + 1); // can be 0
+  rc = MPI_File_write_at_all(fh, off, (void*)Aloc, count, MPI_FLOAT, MPI_STATUS_IGNORE);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+
+  // Make data durable/visible (sync is generally not collective, but safe to call on all)
+  rc = MPI_File_sync(fh);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+
+  int rc2 = MPI_File_close(&fh);
+  if (rc == MPI_SUCCESS) rc = rc2;
+  return rc;
+}
+
+static int ckpt_read_parallel(MPI_Comm active, const char* path,
+                              int* N, int* phase, int* step,
+                              int row0, int nloc,
+                              float* Aloc) {
+  MPI_File fh;
+  int rc = MPI_File_open(active, path, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+  if (rc != MPI_SUCCESS) return rc;
+
+  int arank;
+  MPI_Comm_rank(active, &arank);
+
+  ckpt_hdr h = {0};
   if (arank == 0) {
-    ckpt_write_root_self(path, N, phase, step, Afull);
-    free(Afull);
+    rc = MPI_File_read_at(fh, 0, &h, (int)sizeof(h), MPI_BYTE, MPI_STATUS_IGNORE);
+    if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+    if (h.magic != 0x47555353 || h.version != 1) {
+      MPI_File_close(&fh);
+      return MPI_ERR_OTHER;
+    }
   }
 
-  return MPI_Barrier(active);
+  // Broadcast header to all ranks in active
+  rc = MPI_Bcast(&h, (int)sizeof(h), MPI_BYTE, 0, active);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+
+  *N = h.N;
+  *phase = h.phase;
+  *step = h.step;
+
+  // Barrier before collective read (helps keep behavior deterministic)
+  rc = MPI_Barrier(active);
+  if (rc != MPI_SUCCESS) { MPI_File_close(&fh); return rc; }
+
+  MPI_Offset off =
+    (MPI_Offset)sizeof(ckpt_hdr) +
+    (MPI_Offset)row0 * (MPI_Offset)(h.N + 1) * (MPI_Offset)sizeof(float);
+
+  int count = nloc * (h.N + 1);
+  rc = MPI_File_read_at_all(fh, off, Aloc, count, MPI_FLOAT, MPI_STATUS_IGNORE);
+
+  int rc2 = MPI_File_close(&fh);
+  if (rc == MPI_SUCCESS) rc = rc2;
+  return rc;
+}
+
+// ---------------- checkpoint wrappers ----------------
+static int checkpoint_save(MPI_Comm active, const char* path,
+                           int N, int phase, int step,
+                           int row0, const float* Aloc, int nloc) {
+  return ckpt_write_parallel(active, path, N, phase, step, row0, nloc, Aloc);
 }
 
 static int checkpoint_load(MPI_Comm active, const char* path,
                            int* N, int* phase, int* step,
-                           float* Aloc, int nloc,
-                           int* counts, int* displs) {
-  int arank;
-  MPI_Comm_rank(active, &arank);
-
-  float* Afull = NULL;
-  int N0 = *N, ph0 = *phase, st0 = *step;
-
-  if (arank == 0) {
-    Afull = (float*)malloc((size_t)(*N) * (size_t)((*N) + 1) * sizeof(float));
-    if (!Afull) die("malloc Afull failed(load)");
-    int ok = ckpt_read_root_self(path, &N0, &ph0, &st0, Afull);
-    if (!ok) die("Checkpoint missing on load");
-  }
-
-  int rc = MPI_Bcast(&N0, 1, MPI_INT, 0, active);
-  if (rc != MPI_SUCCESS) { if (Afull) free(Afull); return rc; }
-  rc = MPI_Bcast(&ph0, 1, MPI_INT, 0, active);
-  if (rc != MPI_SUCCESS) { if (Afull) free(Afull); return rc; }
-  rc = MPI_Bcast(&st0, 1, MPI_INT, 0, active);
-  if (rc != MPI_SUCCESS) { if (Afull) free(Afull); return rc; }
-
-  *N = N0; *phase = ph0; *step = st0;
-
-  rc = MPI_Scatterv(Afull, counts, displs, MPI_FLOAT,
-                    Aloc, nloc * (N0 + 1), MPI_FLOAT, 0, active);
-
-  if (arank == 0) free(Afull);
-  return rc;
+                           int row0, float* Aloc, int nloc) {
+  return ckpt_read_parallel(active, path, N, phase, step, row0, nloc, Aloc);
 }
 
-// ---------------- ACTIVE allocation/rebuild  ----------------
+// ---------------- ACTIVE allocation/rebuild ----------------
 static void active_alloc_rebuild(MPI_Comm active, int N,
                                  int* row0, int* nloc,
-                                 float** Aloc,
-                                 int** counts, int** displs) {
+                                 float** Aloc) {
   int asize, arank;
   MPI_Comm_size(active, &asize);
   MPI_Comm_rank(active, &arank);
@@ -209,22 +214,13 @@ static void active_alloc_rebuild(MPI_Comm active, int N,
   free(*Aloc);
   *Aloc = (float*)malloc((size_t)(*nloc) * (size_t)(N + 1) * sizeof(float));
   if (!*Aloc) die("malloc Aloc failed");
-
-  free(*counts);
-  free(*displs);
-  *counts = (int*)malloc((size_t)asize * sizeof(int));
-  *displs = (int*)malloc((size_t)asize * sizeof(int));
-  if (!*counts || !*displs) die("malloc counts/displs failed");
-
-  make_counts_displs(N, asize, *counts, *displs);
 }
 
-// ---------------- Gauss (ACTIVE).  ----------------
+// ---------------- Gauss (ACTIVE). Returns MPI error if any collective fails ----------------
 static int gauss_run(MPI_Comm active, int N,
                      int* phase_io, int* step_io,
                      int row0, int nloc, float* A,
                      const char* ckpt_path, int ckpt_period,
-                     int* counts, int* displs,
                      int* last_phase, int* last_step) {
   int arank, asize;
   MPI_Comm_rank(active, &arank);
@@ -252,13 +248,12 @@ static int gauss_run(MPI_Comm active, int N,
       *last_phase = PH_ELIM; *last_step = i;
 
       if (world_rank == fail_rank && fail_phase == PH_ELIM && fail_step == i) {
-        fprintf(stderr,
-        "KILLING myself: world_rank=%d pid=%d phase=%d step=%d\n",
-        world_rank, getpid(), phase, i);
+        fprintf(stderr, "KILLING myself: world_rank=%d pid=%d phase=%d step=%d\n",
+                world_rank, getpid(), phase, i);
         fflush(stderr);
         raise(SIGKILL);
       }
-        
+
       int owner = owner_of_row(N, asize, i);
       if (arank == owner) {
         int li = i - row0;
@@ -280,22 +275,21 @@ static int gauss_run(MPI_Comm active, int N,
 
       // safe checkpoint only in ELIM (A is sufficient state here)
       if (ckpt_period > 0 && (i % ckpt_period == 0)) {
-        rc = checkpoint_save(active, ckpt_path, N, PH_ELIM, i + 1, A, nloc, counts, displs);
+        rc = checkpoint_save(active, ckpt_path, N, PH_ELIM, i + 1, row0, A, nloc);
         if (rc != MPI_SUCCESS) { free(pivot); return rc; }
       }
     }
 
-    // switch to back-substitution, make a boundary checkpoint
+    // boundary checkpoint before BACK
     phase = PH_BACK;
     step  = N - 2;
     {
-      int rc = checkpoint_save(active, ckpt_path, N, phase, step, A, nloc, counts, displs);
+      int rc = checkpoint_save(active, ckpt_path, N, phase, step, row0, A, nloc);
       if (rc != MPI_SUCCESS) { free(pivot); return rc; }
     }
   }
 
-  // back substitution
-  // NOTE: no checkpoints inside BACK
+  // back substitution (no checkpoints inside BACK)
   float* X = (float*)calloc((size_t)N, sizeof(float));
   if (!X) die("calloc X failed");
 
@@ -390,7 +384,7 @@ int main(int argc, char** argv) {
   if (active != MPI_COMM_NULL) MPI_Comm_set_errhandler(active, MPI_ERRORS_RETURN);
 
   int N = 0, phase = PH_ELIM, step = 0;
-  int ckpt_period = 2;
+  int ckpt_period = 10;
 
   // active rank0 reads N
   if (active != MPI_COMM_NULL) {
@@ -411,15 +405,12 @@ int main(int argc, char** argv) {
   int rc = MPI_Bcast(&N, 1, MPI_INT, 0, world);
   if (rc != MPI_SUCCESS) die_mpi("MPI_Bcast(N,world)", rc);
 
-  // ACTIVE buffers
   float* Aloc = NULL;
   int row0 = 0, nloc = 0;
-  int* counts = NULL;
-  int* displs = NULL;
 
   // init + initial checkpoint
   if (active != MPI_COMM_NULL) {
-    active_alloc_rebuild(active, N, &row0, &nloc, &Aloc, &counts, &displs);
+    active_alloc_rebuild(active, N, &row0, &nloc, &Aloc);
 
     for (int lk = 0; lk < nloc; lk++) {
       int i = row0 + lk;
@@ -428,7 +419,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    rc = checkpoint_save(active, ckpt_path, N, phase, step, Aloc, nloc, counts, displs);
+    rc = checkpoint_save(active, ckpt_path, N, phase, step, row0, Aloc, nloc);
     if (rc != MPI_SUCCESS) die_mpi("initial checkpoint_save", rc);
   }
 
@@ -442,7 +433,7 @@ int main(int argc, char** argv) {
 
     if (active != MPI_COMM_NULL) {
       active_rc = gauss_run(active, N, &phase, &step, row0, nloc, Aloc,
-                            ckpt_path, ckpt_period, counts, displs,
+                            ckpt_path, ckpt_period,
                             &last_phase, &last_step);
 
       if (active_rc != MPI_SUCCESS) {
@@ -501,10 +492,11 @@ int main(int argc, char** argv) {
 
     if (active != MPI_COMM_NULL) {
       MPI_Comm_set_errhandler(active, MPI_ERRORS_RETURN);
-      active_alloc_rebuild(active, N, &row0, &nloc, &Aloc, &counts, &displs);
 
-      // reload from checkpoint (always safe now: either ELIM with A, or BACK boundary checkpoint)
-      rc = checkpoint_load(active, ckpt_path, &N, &phase, &step, Aloc, nloc, counts, displs);
+      active_alloc_rebuild(active, N, &row0, &nloc, &Aloc);
+
+      // reload from checkpoint
+      rc = checkpoint_load(active, ckpt_path, &N, &phase, &step, row0, Aloc, nloc);
       if (rc != MPI_SUCCESS) die_mpi("checkpoint_load after recovery", rc);
     }
   }
@@ -517,8 +509,6 @@ int main(int argc, char** argv) {
   }
 
   free(Aloc);
-  free(counts);
-  free(displs);
   if (active != MPI_COMM_NULL) MPI_Comm_free(&active);
 
   MPI_Finalize();
