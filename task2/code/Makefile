@@ -1,61 +1,55 @@
 # ======================================================
-# Makefile: Gaussian Elimination with MPI-IO + ULFM
-# Scenario (b): spawn new MPI processes after failure
-# OpenMPI (built with --with-ft=ulfm)
+# Makefile: Gauss + MPI-IO checkpoint + ULFM + warm spares (scenario a)
 # ======================================================
 
-# ---- OpenMPI ULFM installation ----
 OMPI_PREFIX := $(HOME)/opt/openmpi-ulfm-api
 MPICC       := $(OMPI_PREFIX)/bin/mpicc
 MPIRUN      := $(OMPI_PREFIX)/bin/mpirun
 
-# ---- Compilation flags ----
-CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wpedantic -DUSE_ULFM
+CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS :=
 
-# ---- Target ----
-TARGET := gauss_ft_mpiio
-SRC    := gauss_ft_mpiio.c
+TARGET := gauss_scenario_a
+SRC    := gauss_scenario_a.c
 
-# ---- Runtime parameters ----
-NP := 6
+WORK   := 4
+SPARES := 2
+NP     := $(shell echo $$(( $(WORK) + $(SPARES) )) )
 
-# ВАЖНО:
-#  - --with-ft ulfm  : включаем ULFM
-#  - --mca io ^ompio : отключаем OMPIO (MPI-IO стабильнее с ROMIO)
-RUNOPTS := --oversubscribe --with-ft ulfm --mca io ompio
+CKPT := /tmp/gauss_spares.ckpt
 
+# normal run (no FT framework)
+RUNOPTS := --oversubscribe --mca io ompio --mca state_base_verbose 10 --mca plm_base_verbose 10
 
-# ---- Phony targets ----
-.PHONY: all run fail info clean
+# FT run:
+# - enable ULFM
+# - keep ompio (works in your build)
+# - force coll modules away from tuned/ucc/han (often needed for ULFM)
+# - disable help aggregation for clearer logs
+RUNOPTS_FT := --oversubscribe --with-ft ulfm --mca io ompio \
+             --mca coll ^han,ucc,tuned \
+             --mca orte_base_help_aggregate 1
 
-# ---- Build ----
+.PHONY: all run run_ft fail_ft info clean
+
 all: $(TARGET)
 
 $(TARGET): $(SRC)
 	$(MPICC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-# ---- Normal run ----
-run: $(TARGET)
-	$(MPIRUN) $(RUNOPTS) -np $(NP) ./$(TARGET)
+run_ft: $(TARGET)
+	$(MPIRUN) $(RUNOPTS_FT) -np $(NP) ./$(TARGET) data.in $(CKPT) $(WORK)
 
-# ---- Run with simulated failure ----
-# FAIL_RANK  – номер MPI-процесса, который "падает"
-# FAIL_PHASE – 0: elimination, 1: back substitution
-# FAIL_STEP  – номер шага алгоритма
-fail: $(TARGET)
+fail_ft: $(TARGET)
 	FAIL_RANK=2 FAIL_PHASE=0 FAIL_STEP=3 \
-	$(MPIRUN) $(RUNOPTS) -np $(NP) ./$(TARGET)
+	$(MPIRUN) $(RUNOPTS_FT) -np $(NP) ./$(TARGET) data.in $(CKPT) $(WORK)
 
-# ---- Info ----
 info:
-	@echo "OMPI_PREFIX = $(OMPI_PREFIX)"
-	@echo "MPICC       = $(MPICC)"
-	@echo "MPIRUN      = $(MPIRUN)"
-	@echo "TARGET      = $(TARGET)"
-	@echo "NP          = $(NP)"
-	@echo "RUNOPTS     = $(RUNOPTS)"
+	@echo "WORK=$(WORK) SPARES=$(SPARES) NP=$(NP)"
+	@echo "CKPT=$(CKPT)"
+	@echo "RUNOPTS=$(RUNOPTS)"
+	@echo "RUNOPTS_FT=$(RUNOPTS_FT)"
 
-# ---- Clean ----
 clean:
-	rm -f $(TARGET) *.o gauss.ckpt
+	rm -f $(TARGET) *.o
+	rm -f $(CKPT)
