@@ -25,7 +25,7 @@ static void log_init(void) {
   if (s) LOG = atoi(s);
 }
 
-static void log0(MPI_Comm comm, const char* fmt, ...) {
+static void logger(MPI_Comm comm, const char* fmt, ...) {
   if (!LOG) return;
   int r = -1;
   if (comm != MPI_COMM_NULL) MPI_Comm_rank(comm, &r);
@@ -78,14 +78,20 @@ static int maybe_revoke_on_failure(MPI_Comm world, int rc,
   *revoked_flag = 1;
   int wr = -1;
   MPI_Comm_rank(world, &wr);
-  log0(world, "PROC_FAILED noticed by world_rank=%d at phase=%d step=%d -> revoke",
+  logger(world, "PROC_FAILED noticed by world_rank=%d at phase=%d step=%d -> revoke",
        wr, last_phase, last_step);
+  fflush(stdout);
+
+  // По существу флаг revoked_flag быссмысленнен и пособен защитить от шума в логах
+  // revoke "идемпотентен" и его повторный вызов другим процессом обладает тем же смыслом - будим всех!
   MPIX_Comm_revoke(world);
   return 1;
 }
 
+
 static void block_decomp(int N, int P, int r, int* r0, int* rn) {
-  int base = N / P, rem = N % P;
+  // Каждый процесс получает фиксированный набор строк
+  int base = N / P, rem = N % P; // rem нужен, чтобы в ситуации N%P != 0 корретно разбить строки и дать первым процессам на одну строку больше
   int nloc = base + (r < rem ? 1 : 0);
   int start = r * base + (r < rem ? r : rem);
   *r0 = start;
@@ -93,8 +99,9 @@ static void block_decomp(int N, int P, int r, int* r0, int* rn) {
 }
 
 static int owner_of_row(int N, int P, int row) {
+  // По номеру строки определить номер процесса
   int base = N / P, rem = N % P;
-  int cut = (base + 1) * rem;
+  int cut = (base + 1) * rem; // граница, где заканчиваются "увеличенные" блоки (base+1) (см. block_decomp)
   if (row < cut) return row / (base + 1);
   return rem + (row - cut) / base;
 }
@@ -194,7 +201,7 @@ static int ckpt_read_parallel(MPI_Comm active, const char* path,
   return rc;
 }
 
-// ---------------- фаза ACTIVE (перестроение) ----------------
+// пересчитывает локальный диапазон строк (row0,nloc) и (пере)выделяет буфер Aloc под новую декомпозицию
 static void active_alloc_rebuild(MPI_Comm active, int N,
                                  int* row0, int* nloc,
                                  float** Aloc) {
@@ -266,13 +273,14 @@ static int gauss_run(MPI_Comm active, int N,
       int rc = MPI_Bcast(pivot, N + 1, MPI_FLOAT, owner, active);
       if (rc != MPI_SUCCESS) { free(pivot); return rc; }
 
+      // СМ. пошаговый алгоритм на МИРО
       for (int lk = 0; lk < nloc; lk++) {
         int k = row0 + lk;
         if (k <= i) continue;
-        float aik = A[lk * (N + 1) + i];
+        float aki = A[lk * (N + 1) + i];
         float pii = pivot[i];
         for (int j = i + 1; j <= N; j++) {
-          A[lk * (N + 1) + j] -= aik * pivot[j] / pii;
+          A[lk * (N + 1) + j] -= aki * pivot[j] / pii;
         }
       }
 
@@ -298,7 +306,7 @@ static int gauss_run(MPI_Comm active, int N,
   int owner_last = owner_of_row(N, asize, N - 1);
   if (arank == owner_last) {
     int ll = (N - 1) - row0;
-    X[N - 1] = A[ll * (N + 1) + N] / A[ll * (N + 1) + (N - 1)];
+    X[N - 1] = A[ll * (N + 1) + N] / A[ll * (N + 1) + (N - 1)]; // A[N-1][N] / A[N-1][N-1]
   }
 
   int rc = MPI_Bcast(&X[N - 1], 1, MPI_FLOAT, owner_last, active);
@@ -309,7 +317,7 @@ static int gauss_run(MPI_Comm active, int N,
     *last_step  = j;
 
     if (world_rank == fail_rank && fail_phase == PH_BACK && fail_step == j) {
-      log0(active, "INJECT_FAIL: world_rank=%d phase=BACK step=%d", world_rank, j);
+      logger(active, "INJECT_FAIL: world_rank=%d phase=BACK step=%d", world_rank, j);
       raise(SIGKILL);
     }
 
@@ -368,7 +376,7 @@ int main(int argc, char** argv) {
   if (WORK <= 0 || WORK > world_size) die("Bad WORK value");
 
   if (world_rank == 0) {
-    log0(world, "START: world_size=%d WORK=%d SPARES=%d", world_size, WORK, world_size - WORK);
+    logger(world, "START: world_size=%d WORK=%d SPARES=%d", world_size, WORK, world_size - WORK);
   }
 
   MPI_Comm active = build_active_from_world(world, WORK);
@@ -385,7 +393,7 @@ int main(int argc, char** argv) {
       if (!in) die("Cannot open data.in");
       if (fscanf(in, "%d", &N) != 1) die("Wrong data.in");
       fclose(in);
-      log0(active, "READ N=%d", N);
+      logger(active, "READ N=%d", N);
     }
     int rc = MPI_Bcast(&N, 1, MPI_INT, 0, active);
     if (rc != MPI_SUCCESS) die_mpi("MPI_Bcast(N)", rc);
