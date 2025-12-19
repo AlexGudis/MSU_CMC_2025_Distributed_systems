@@ -5,7 +5,7 @@
 #define N 8
 #define V 64
 
-static inline int imax(int a, int b){ return a > b ? a : b; }
+int max(int a, int b){ return a > b ? a : b; }
 
 int main(int argc, char** argv){
     MPI_Init(&argc, &argv);
@@ -22,7 +22,7 @@ int main(int argc, char** argv){
     }
 
     int dims[2] = {N, N};
-    int periods[2] = {0, 0};
+    int periods[2] = {0, 0}; // Замкнуть как тор? (Карта Карно из ДМ)
     MPI_Comm grid;
     MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 0, &grid);
 
@@ -34,10 +34,11 @@ int main(int argc, char** argv){
     MPI_Cart_shift(grid, 1, 1, &left, &right);
     MPI_Cart_shift(grid, 0, 1, &up, &down);
 
-    // Вводим матрицу A[64]
-    int A[V], buf[V];
-    for(int i=0;i<V;i++) A[i] = rank + i;
-    for(int i=0;i<V;i++) buf[i] = A[i];
+    // Вводим массив A[64]
+    int buf[V];
+    for(int i=0;i<V;i++) {
+        buf[i] = rank + i;
+    }
 
     MPI_Status st;
 
@@ -48,7 +49,7 @@ int main(int argc, char** argv){
         } else if(x == k-1){
             int tmp[V];
             MPI_Recv(tmp, V, MPI_INT, right, 1000 + y, grid, &st);
-            for(int i=0;i<V;i++) buf[i] = imax(buf[i], tmp[i]);
+            for(int i=0;i<V;i++) buf[i] = max(buf[i], tmp[i]);
         }
     }
 
@@ -60,7 +61,7 @@ int main(int argc, char** argv){
             } else if(y == k-1){
                 int tmp[V];
                 MPI_Recv(tmp, V, MPI_INT, down, 2000, grid, &st);
-                for(int i=0;i<V;i++) buf[i] = imax(buf[i], tmp[i]);
+                for(int i=0;i<V;i++) buf[i] = max(buf[i], tmp[i]);
             }
         }
     }
@@ -117,6 +118,7 @@ int main(int argc, char** argv){
 
     // Проверка
     // printf("rank=%d (x=%d,y=%d) got R[%d]=%d\n", rank, x, y, rank, my_result);
+    // fflush(stdout);
 
     int expected = 63 + rank;
     if (my_result != expected) {
