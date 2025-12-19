@@ -1,263 +1,131 @@
-#include <mpi.h>      // Подключаем заголовок MPI: объявления MPI_Init/MPI_Send/MPI_Comm и т.д.
-#include <stdio.h>    // Для printf/fprintf (вывод на экран/в stderr).
-#include <stdlib.h>   // Для malloc/free и MPI_Abort обычно тоже удобно иметь stdlib.
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-#define N 8           // Размерность одной стороны транспьютерной матрицы: 8×8 узлов.
-#define V 64          // Длина вектора в каждом процессе: 64 числа (по заданию).
+#define N 8
+#define V 64
 
-// Вспомогательная функция: возвращает максимум из двух int.
-// static inline:
-//   static  — видна только внутри этого файла (не экспортируется наружу);
-//   inline  — компилятору можно (но не обязательно) встроить вызов (быстрее, без overhead).
 static inline int imax(int a, int b){ return a > b ? a : b; }
 
-// Точка входа C-программы. argc/argv — аргументы командной строки.
-// MPI_Init может использовать argc/argv для своих опций и/или удалить MPI-опции из argv.
 int main(int argc, char** argv){
-    MPI_Init(&argc, &argv);                 // Инициализация MPI: без этого любые MPI_* вызовы запрещены.
+    MPI_Init(&argc, &argv);
 
-    int size, rank;                         // size — число процессов в коммуникаторе, rank — номер текущего процесса.
-    MPI_Comm_size(MPI_COMM_WORLD, &size);   // Узнаём, сколько процессов запущено в MPI_COMM_WORLD (должно быть 64).
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);   // Узнаём rank текущего процесса в MPI_COMM_WORLD: 0..size-1.
+    int size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    // fprintf(stderr, "rank=%d size=%d\n", rank, size); // Отладка: печать rank/size (закомментировано).
+    // fprintf(stderr, "rank=%d size=%d\n", rank, size);
 
-    if(size != N*N){                        // Проверяем строгое условие задачи: нужна матрица 8×8 = 64 процесса.
-        if(rank == 0)                       // Сообщение об ошибке печатает только процесс 0, чтобы не засорять вывод.
-            fprintf(stderr, "Run with %d processes\n", N*N); // Подсказка пользователю, сколько процессов надо.
-        MPI_Abort(MPI_COMM_WORLD, 1);       // Аварийно завершаем ВСЕ процессы MPI_COMM_WORLD (код ошибки 1).
+    if(size != N*N){
+        if(rank == 0) fprintf(stderr, "Run with %d processes\n", N*N);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // 2D cartesian grid 8x8
-    int dims[2] = {N, N};                   // Размеры декартовой решётки: dims[0]=8 (ось y), dims[1]=8 (ось x).
-    int periods[2] = {0, 0};                // periods=0 => решётка НЕ тор: на краях нет “замыкания” (нет wrap-around).
-    MPI_Comm grid;                          // Новый коммуникатор, в котором процессы имеют топологию 8×8.
-    MPI_Cart_create(
-        MPI_COMM_WORLD,                     // old_comm: берём процессы из MPI_COMM_WORLD
-        2,                                  // ndims: двумерная решётка
-        dims,                               // dims: размеры по измерениям
-        periods,                            // periods: замкнутость по измерениям
-        0,                                  // reorder=0: MPI не меняет порядок рангов (проще отлаживать и объяснять)
-        &grid                               // new_comm: результат — декартов коммуникатор
-    );
+    int dims[2] = {N, N};
+    int periods[2] = {0, 0};
+    MPI_Comm grid;
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 0, &grid);
 
-    int coords[2];                          // Сюда MPI запишет координаты процесса в решётке.
-    MPI_Cart_coords(
-        grid,                               // comm: декартов коммуникатор
-        rank,                               // rank: ранг процесса в grid (при reorder=0 совпадает с rank в WORLD)
-        2,                                  // maxdims: ожидаем 2 координаты
-        coords                              // coords[0], coords[1]
-    );
-    int y = coords[0], x = coords[1];       // Для удобства: y — “строка”, x — “столбец” в 8×8.
+    int coords[2];
+    MPI_Cart_coords(grid, rank, 2, coords);
+    int y = coords[0], x = coords[1];
 
-    int left, right, up, down;              // Ранги соседей (в коммуникаторе grid) по 4 направлениям.
-    MPI_Cart_shift(
-        grid,                               // comm: топология grid
-        1,                                  // direction=1 => ось x (столбцы)
-        1,                                  // disp=1 => ближайший сосед
-        &left,                              // rank_source: сосед “сзади” по +disp (в нашей интерпретации назвали left)
-        &right                              // rank_dest:   сосед “впереди” по +disp (назвали right)
-    ); // shift in x (dim=1)
-    MPI_Cart_shift(
-        grid,                               // comm: топология grid
-        0,                                  // direction=0 => ось y (строки)
-        1,                                  // disp=1 => ближайший сосед
-        &up,                                // сосед сверху (по нашей договорённости)
-        &down                               // сосед снизу
-    ); // shift in y (dim=0)
+    int left, right, up, down;
+    MPI_Cart_shift(grid, 1, 1, &left, &right);
+    MPI_Cart_shift(grid, 0, 1, &up, &down);
 
-    // Input: A[64] (example init)
-    int A[V], buf[V];                       // A — исходный массив процесса; buf — рабочий буфер для редукции MAX.
-    for(int i=0;i<V;i++) A[i] = rank + i;   // Пример инициализации: значение зависит от rank и индекса (для теста).
-    for(int i=0;i<V;i++) buf[i] = A[i];     // Копируем A в buf: buf будет “частичным максимумом” на каждом шаге.
+    // Вводим матрицу A[64]
+    int A[V], buf[V];
+    for(int i=0;i<V;i++) A[i] = rank + i;
+    for(int i=0;i<V;i++) buf[i] = A[i];
 
-    MPI_Status st;                          // MPI_Status: структура с метаданными принятого сообщения (источник, tag и т.п.).
+    MPI_Status st;
 
-    // ---------------------------
-    // Phase A1: row-reduce to x=0 (shift left)
-    // For k = 7..1: nodes with x==k send to left, nodes with x==k-1 recv from right
-    for(int k = N-1; k >= 1; --k){          // Идём справа налево: k=7..1 — “волна” редукции по строке.
-        if(x == k){                         // Узлы в колонке k на этом шаге выступают “отправителями”.
-            MPI_Send(
-                buf,                        // отправляем текущий частичный максимум (вектор из 64 int)
-                V,                          // количество элементов
-                MPI_INT,                    // тип элемента
-                left,                       // адресат: сосед слева (x-1)
-                1000 + y,                   // tag: уникальный для каждой строки y (чтобы не путать сообщения разных строк)
-                grid                        // коммуникатор, где определены ранги соседей
-            );
-        } else if(x == k-1){                // Узлы в колонке k-1 на этом шаге — “получатели”.
-            int tmp[V];                     // Временный буфер, куда примем вектор от соседа справа.
-            MPI_Recv(
-                tmp,                        // куда принимать
-                V,                          // сколько элементов ожидаем
-                MPI_INT,                    // тип элемента
-                right,                      // источник: сосед справа (x+1)
-                1000 + y,                   // tag должен совпадать с отправителем (строка y)
-                grid,                       // коммуникатор
-                &st                         // статус приёма (можно было MPI_STATUS_IGNORE)
-            );
-            for(int i=0;i<V;i++)            // После приёма объединяем два вектора поэлементно операцией MAX.
-                buf[i] = imax(buf[i], tmp[i]); // buf становится новым частичным максимумом для всей “правой части строки”.
+    // Редукция по строкам: сдвиг влево
+    for(int k = N-1; k >= 1; --k){
+        if(x == k){
+            MPI_Send(buf, V, MPI_INT, left, 1000 + y, grid);
+        } else if(x == k-1){
+            int tmp[V];
+            MPI_Recv(tmp, V, MPI_INT, right, 1000 + y, grid, &st);
+            for(int i=0;i<V;i++) buf[i] = imax(buf[i], tmp[i]);
         }
-        // Остальные узлы на этом k ничего не делают: так избегаем дедлоков (нет “Send<->Send” между соседями).
     }
 
-    // ---------------------------
-    // Phase A2: column-reduce on x=0 to y=0 (shift up)
-    if(x == 0){                             // Теперь редуцируем по столбцу x=0: участвуют только “лидеры строк”.
-        for(int k = N-1; k >= 1; --k){      // Снизу вверх: k=7..1 — волна редукции по колонке.
-            if(y == k){                     // Узел на строке k (в колонке 0) отправляет вверх.
-                MPI_Send(
-                    buf,                    // отправляем полный вектор частичного максимума своей строки
-                    V,
-                    MPI_INT,
-                    up,                     // адресат: сосед сверху (y-1)
-                    2000,                   // tag для “колоночной” редукции (отдельный от 1000+y)
-                    grid
-                );
-            } else if(y == k-1){            // Узел на строке k-1 принимает от соседа снизу.
-                int tmp[V];                 // буфер под принятый вектор
-                MPI_Recv(
-                    tmp,
-                    V,
-                    MPI_INT,
-                    down,                   // источник: сосед снизу (y+1)
-                    2000,                   // тот же tag, что у отправителя
-                    grid,
-                    &st
-                );
-                for(int i=0;i<V;i++)        // объединяем поэлементно MAX, получая максимум по всем строкам ниже/включая
-                    buf[i] = imax(buf[i], tmp[i]);
+    // Редукция по столбцу x=0: сдвиг вверх
+    if(x == 0){
+        for(int k = N-1; k >= 1; --k){
+            if(y == k){
+                MPI_Send(buf, V, MPI_INT, up, 2000, grid);
+            } else if(y == k-1){
+                int tmp[V];
+                MPI_Recv(tmp, V, MPI_INT, down, 2000, grid, &st);
+                for(int i=0;i<V;i++) buf[i] = imax(buf[i], tmp[i]);
             }
         }
     }
-    // Теперь (после A2) узел (x=0,y=0) содержит полный результат редукции R[0..63] в buf[].
-    // Остальные узлы имеют либо частичный, либо неактуальный buf (это нормально).
 
-    // ---------------------------
-    // Phase B1: scatter row-blocks (8 ints) down column x=0
-    int rowblock[N];                        // Блок из 8 int: это “кусок” R для одной строки y: R[y*8 .. y*8+7].
-    int have_rowblock = 0;                  // Флаг: получили ли мы свой rowblock (актуально для x==0).
 
-    if(x == 0){                             // Снова работаем только в колонке x=0: раздаём rowblock лидерам строк.
-        // root starts with whole R in buf[]
-        if(y == 0){                         // Корень (0,0) уже имеет весь R[64] в buf[].
-            // keep own rowblock [0..7]
-            for(int i=0;i<N;i++)            // Выделяем свой блок для строки y=0.
-                rowblock[i] = buf[i];       // rowblock = R[0..7]
-            have_rowblock = 1;              // помечаем, что блок есть
+    // По столбцу x=0 раздать блоки по 8 элементов лидерам строк (0,y)
+    int rowblock[N];     
+    int have_rowblock = 0;
 
-            // send tail for rows 1..7 (56 ints)
-            int tailCount = (N-1)*N;        // Сколько int надо отправить вниз: для строк 1..7 это 7*8 = 56.
-            MPI_Send(
-                &buf[N],                    // отправляем “хвост” R[8..63] (начиная с индекса 8)
-                tailCount,                  // 56 int
-                MPI_INT,
-                down,                       // сосед снизу (0,1)
-                3000,                       // tag для рассылки по колонке
-                grid
-            );
-        } else {                            // Узлы (0,y), y>0: получают “хвост”, берут первые 8 для себя, остальное пересылают.
-            // receive tail from above: size = (N - y)*N ints
-            int cnt = (N - y)*N;            // Сколько int должен получить узел (0,y):
-                                             // для y=1 -> 56, y=2 -> 48, ..., y=7 -> 8.
-            int* tail = (int*)malloc(cnt * sizeof(int)); // Динамический буфер под получаемый сегмент.
-            MPI_Recv(
-                tail,                       // куда принимать
-                cnt,                        // сколько int ожидаем
-                MPI_INT,
-                up,                         // источник: сосед сверху (0,y-1)
-                3000,                       // tag колоночного scatter
-                grid,
-                &st
-            );
+    if(x == 0){
+        if(y == 0){
+            for(int i=0;i<N;i++) rowblock[i] = buf[i];
+            have_rowblock = 1;
 
-            // first 8 ints are my rowblock
-            for(int i=0;i<N;i++)            // Первые 8 чисел из tail — предназначены этой строке y.
-                rowblock[i] = tail[i];      // rowblock = R[y*8 .. y*8+7]
-            have_rowblock = 1;              // отмечаем наличие блока
+            int tailCount = (N-1)*N; // 56
+            MPI_Send(&buf[N], tailCount, MPI_INT, down, 3000, grid);
+        } else {
+            int cnt = (N - y)*N;
+            int* tail = (int*)malloc(cnt * sizeof(int));
+            MPI_Recv(tail, cnt, MPI_INT, up, 3000, grid, &st);
 
-            // forward remaining (cnt-8) ints further down, if any
-            if(y != N-1){                   // Если мы не на последней строке, есть кому пересылать дальше.
-                int rest = cnt - N;         // Остаток после первых 8 (cnt-8).
-                MPI_Send(
-                    &tail[N],               // начинаем пересылать с tail[8]
-                    rest,                   // сколько осталось
-                    MPI_INT,
-                    down,                   // следующий узел вниз
-                    3000,                   // тот же tag, чтобы цепочка была единообразной
-                    grid
-                );
+            for(int i=0;i<N;i++) rowblock[i] = tail[i];
+            have_rowblock = 1;
+
+            if(y != N-1){
+                int rest = cnt - N;
+                MPI_Send(&tail[N], rest, MPI_INT, down, 3000, grid);
             }
-            free(tail);                     // Освобождаем динамический буфер.
+            free(tail);
         }
     }
 
-    // ---------------------------
-    // Phase B2: scatter 1 int along each row from x=0 to x=7
-    int my_result = -1;                     // Итоговое число, которое должен получить данный процесс: R[rank].
+    // В каждой строке y лидер (0,y) раздаёт по одному элементу вправо по строке до нужного x
+    int my_result = -1;
 
-    if(x == 0){                             // Лидер строки (0,y) сейчас держит rowblock[0..7] для своей строки.
-        // row leader: my element is rowblock[0]
-        if(have_rowblock)                   // На всякий случай проверяем, что блок получен (для корректности логики).
-            my_result = rowblock[0];        // Узел (0,y) соответствует x=0, значит ему нужен первый элемент блока: R[y*8+0].
+    if(x == 0){
+        if(have_rowblock) my_result = rowblock[0];
 
-        // send tail elements [1..7] as decreasing message along the row
-        if(N > 1){                          // Если в строке больше одного узла (у нас N=8, всегда true).
-            MPI_Send(
-                &rowblock[1],               // отправляем оставшиеся 7 элементов (для x=1..7)
-                N-1,                        // 7 int
-                MPI_INT,
-                right,                      // сосед справа (1,y)
-                4000 + y,                   // tag уникальный по строке (чтобы разные строки не смешались)
-                grid
-            );
+        if(N > 1){
+            MPI_Send(&rowblock[1], N-1, MPI_INT, right, 4000 + y, grid);
         }
-    } else {                                // Все остальные узлы строки (x>0) получают “хвост” и берут первый элемент как свой.
-        // receive tail of length (N-x) from left
-        int cnt = N - x;                    // Сколько элементов должно прийти узлу (x,y):
-                                             // x=1 -> 7, x=2 -> 6, ..., x=7 -> 1.
-        int* tail = (int*)malloc(cnt * sizeof(int)); // Буфер под принятый сегмент.
-        MPI_Recv(
-            tail,                           // куда принимать
-            cnt,                            // сколько int
-            MPI_INT,
-            left,                           // источник: сосед слева (x-1,y)
-            4000 + y,                       // tag строки
-            grid,
-            &st
-        );
+    } else {
+        int cnt = N - x;
+        int* tail = (int*)malloc(cnt * sizeof(int));
+        MPI_Recv(tail, cnt, MPI_INT, left, 4000 + y, grid, &st);
 
-        // first element is mine
-        my_result = tail[0];                // Первый элемент в хвосте — ровно то, что предназначено данному x.
+        my_result = tail[0];
 
-        // forward remaining to the right if any
-        if(x != N-1){                       // Если мы не самый правый (x<7), нужно переслать остаток дальше.
-            MPI_Send(
-                &tail[1],                   // пересылаем начиная со второго элемента
-                cnt-1,                      // на 1 меньше
-                MPI_INT,
-                right,                      // сосед справа
-                4000 + y,                   // тот же tag строки
-                grid
-            );
+        if(x != N-1){
+            MPI_Send(&tail[1], cnt-1, MPI_INT, right, 4000 + y, grid);
         }
-        free(tail);                         // Освобождаем буфер.
+        free(tail);
     }
 
-    // Проверка (человеко-читаемый вывод каждого процесса)
+    // Проверка
     // printf("rank=%d (x=%d,y=%d) got R[%d]=%d\n", rank, x, y, rank, my_result);
 
-    int expected = 63 + rank;               // Для тестовой инициализации A[i]=rank+i глобальный MAX даёт R[j]=63+j,
-                                             // значит процесс rank должен получить R[rank]=63+rank.
-    if (my_result != expected) {            // Если получено не то значение — алгоритм/передачи где-то ошиблись.
-        printf("ERROR rank=%d got=%d expected=%d\n", rank, my_result, expected); // Печатаем диагностическое сообщение.
+    int expected = 63 + rank;
+    if (my_result != expected) {
+        printf("ERROR rank=%d got=%d expected=%d\n", rank, my_result, expected);
     }
 
-    MPI_Comm_free(&grid);                   // Освобождаем созданный декартов коммуникатор (ресурсы топологии 8×8).
-    MPI_Finalize();                         // Корректно завершаем MPI: после этого нельзя вызывать MPI_* функции.
+    MPI_Comm_free(&grid);
+    MPI_Finalize();
 
-    // printf("done");                       // Отладка: сообщение о завершении (закомментировано).
-    return 0;                               // Возвращаем 0: успешное завершение процесса.
+    // printf("done");
+    return 0;
 }
